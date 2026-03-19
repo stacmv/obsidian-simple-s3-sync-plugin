@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-simple-s3-sync",
+  "version": "0.1.0",
+  "description": "Simple S3 Sync — minimal Obsidian sync plugin via S3",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "^1.5.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.500.0",
+    "node-diff3": "^3.1.0",
+    "picomatch": "^4.0.0"
+  }
+}
