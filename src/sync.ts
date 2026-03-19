@@ -1,7 +1,7 @@
 import { App, Notice, TFile, normalizePath } from "obsidian";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { S3SyncSettings } from "./settings";
-import type { SyncManifest, ManifestEntry } from "./manifest";
+import type { SyncManifest } from "./manifest";
 import { createEmptyManifest, isLockStale } from "./manifest";
 import { shouldSyncFile } from "./filter";
 import { sha256 } from "./hash";
@@ -28,9 +28,6 @@ export async function runSync(
 ): Promise<SyncResult> {
 	const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
 	const { s3Bucket: bucket, s3Prefix: prefix, deviceName } = settings;
-	const encoder = new TextEncoder();
-	const decoder = new TextDecoder();
-
 	// --- Lock ---
 	const existingLock = await s3.getLock(client, bucket, prefix);
 	if (existingLock && !isLockStale(existingLock)) {
@@ -45,7 +42,7 @@ export async function runSync(
 
 	try {
 		// --- Phase 1: Pull ---
-		let remoteManifest =
+		const remoteManifest =
 			(await s3.getManifest(client, bucket, prefix)) ??
 			createEmptyManifest(deviceName);
 

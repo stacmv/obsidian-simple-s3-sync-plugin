@@ -94,6 +94,7 @@ export default class SimpleS3SyncPlugin extends Plugin {
 		}
 
 		this.syncing = true;
+		new Notice("S3 Sync: starting...");
 		const statusBar = this.addStatusBarItem();
 		statusBar.setText("S3 Sync...");
 

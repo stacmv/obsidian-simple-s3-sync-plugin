@@ -6,10 +6,105 @@ import {
 	DeleteObjectCommand,
 	ListObjectsV2Command,
 } from "@aws-sdk/client-s3";
+import { requestUrl } from "obsidian";
 import type { SyncManifest, SyncLock } from "./manifest";
 
 export type { S3Client };
 export { S3Client as S3ClientClass } from "@aws-sdk/client-s3";
+
+/**
+ * Custom request handler that uses Obsidian's requestUrl to bypass CORS.
+ * Obsidian's requestUrl uses Electron's net module on desktop and
+ * native HTTP on mobile — both bypass browser CORS restrictions.
+ */
+function buildUrl(request: any): string {
+	// AWS SDK v3 HttpRequest has: protocol, hostname, port, path, query
+	if (typeof request.url === "string") return request.url;
+
+	const protocol = request.protocol ?? "https:";
+	const hostname = request.hostname ?? "";
+	const port = request.port ? `:${request.port}` : "";
+	const path = request.path ?? "/";
+
+	let url = `${protocol}//${hostname}${port}${path}`;
+
+	// Append query string
+	if (request.query && typeof request.query === "object") {
+		const params = new URLSearchParams();
+		for (const [k, v] of Object.entries(request.query)) {
+			if (v != null) params.append(k, String(v));
+		}
+		const qs = params.toString();
+		if (qs) url += `?${qs}`;
+	}
+
+	return url;
+}
+
+function obsidianRequestHandler() {
+	return {
+		handle: async (request: any) => {
+			const url = buildUrl(request);
+
+			const headers: Record<string, string> = {};
+			if (request.headers) {
+				for (const [k, v] of Object.entries(request.headers)) {
+					if (v != null) headers[k] = String(v);
+				}
+			}
+			// Remove headers that cause issues with Obsidian's requestUrl
+			delete headers["content-length"];
+			delete headers["Content-Length"];
+			// host header is set automatically
+			delete headers["host"];
+			delete headers["Host"];
+
+			let body: ArrayBuffer | undefined;
+			if (request.body) {
+				if (request.body instanceof Uint8Array) {
+					body = request.body.buffer.slice(
+						request.body.byteOffset,
+						request.body.byteOffset + request.body.byteLength
+					) as ArrayBuffer;
+				} else if (typeof request.body === "string") {
+					body = new TextEncoder().encode(request.body).buffer as ArrayBuffer;
+				} else if (request.body instanceof ArrayBuffer) {
+					body = request.body;
+				}
+			}
+
+			const method = request.method ?? "GET";
+
+			console.debug(`[S3 Sync] ${method} ${url}`);
+
+			const resp = await requestUrl({
+				url,
+				method,
+				headers,
+				body: body,
+				throw: false,
+			});
+
+			const responseHeaders: Record<string, string> = {};
+			for (const [k, v] of Object.entries(resp.headers ?? {})) {
+				responseHeaders[k.toLowerCase()] = v;
+			}
+
+			return {
+				response: {
+					statusCode: resp.status,
+					headers: responseHeaders,
+					body: new ReadableStream({
+						start(controller) {
+							controller.enqueue(new Uint8Array(resp.arrayBuffer));
+							controller.close();
+						},
+					}),
+				},
+			};
+		},
+	};
+}
 
 export function createS3Client(
 	endpoint: string,
@@ -24,7 +119,8 @@ export function createS3Client(
 			accessKeyId: accessKey,
 			secretAccessKey: secretKey,
 		},
-		forcePathStyle: true, // needed for MinIO and most S3-compatible
+		forcePathStyle: true,
+		requestHandler: obsidianRequestHandler() as any,
 	});
 }
 

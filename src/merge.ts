@@ -10,13 +10,14 @@ export function mergeMarkdown(
 	ancestor: string,
 	theirs: string
 ): MergeResult {
-	const result = merge(ours, ancestor, theirs, {
-		stringSeparator: /\n/,
-	} as any);
+	const oursLines = ours.split("\n");
+	const ancestorLines = ancestor.split("\n");
+	const theirsLines = theirs.split("\n");
 
-	const merged = result.result.join("\n");
-	const hasConflicts =
-		merged.includes("<<<<<<<") || merged.includes(">>>>>>>");
+	const result = merge(oursLines, ancestorLines, theirsLines);
 
-	return { success: !hasConflicts, content: merged };
+	return {
+		success: !result.conflict,
+		content: result.result.join("\n"),
+	};
 }
