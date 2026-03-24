@@ -19,12 +19,15 @@ interface LocalCachedManifest {
 	manifest: SyncManifest;
 }
 
+export type SyncProgressCallback = (phase: string, result: SyncResult) => void;
+
 export async function runSync(
 	app: App,
 	client: S3Client,
 	settings: S3SyncSettings,
 	cachedData: LocalCachedManifest | null,
-	saveCachedData: (data: LocalCachedManifest) => Promise<void>
+	saveCachedData: (data: LocalCachedManifest) => Promise<void>,
+	onProgress?: SyncProgressCallback
 ): Promise<SyncResult> {
 	const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
 	const { s3Bucket: bucket, s3Prefix: prefix, deviceName } = settings;
@@ -42,6 +45,7 @@ export async function runSync(
 
 	try {
 		// --- Phase 1: Pull ---
+		onProgress?.("pulling", result);
 		const remoteManifest =
 			(await s3.getManifest(client, bucket, prefix)) ??
 			createEmptyManifest(deviceName);
@@ -56,11 +60,12 @@ export async function runSync(
 			const localFile = app.vault.getAbstractFileByPath(normalizePath(path));
 
 			if (remote.deleted) {
-				// Remote deleted — delete locally if exists
+				// Remote deleted: trash local copy if it exists
 				if (localFile instanceof TFile) {
 					try {
 						await app.vault.trash(localFile, true);
 						result.pulled++;
+						onProgress?.("pulling", result);
 					} catch (e: any) {
 						result.errors.push(`Delete ${path}: ${e.message}`);
 					}
@@ -69,7 +74,12 @@ export async function runSync(
 			}
 
 			if (!localFile) {
-				// File doesn't exist locally — download
+				if (cached) {
+					// File was previously synced but is now missing locally: it was
+					// deleted locally. Skip download; Phase 2 will soft-delete on S3.
+					continue;
+				}
+				// New file from remote: download it
 				const data = await s3.downloadFile(client, bucket, prefix, path);
 				if (data) {
 					const dir = path.contains("/")
@@ -80,6 +90,7 @@ export async function runSync(
 					}
 					await app.vault.createBinary(normalizePath(path), data.buffer as ArrayBuffer);
 					result.pulled++;
+					onProgress?.("pulling", result);
 				}
 				continue;
 			}
@@ -92,7 +103,7 @@ export async function runSync(
 
 			if (remoteVersion <= cachedVersion) continue; // no remote change
 
-			// Remote has a newer version — check for conflict
+			// Remote has a newer version: check for conflict
 			const localData = new Uint8Array(await app.vault.readBinary(localFile));
 			const localHash = await sha256(localData.buffer as ArrayBuffer);
 			const cachedHash = cached?.sha256 ?? "";
@@ -122,19 +133,22 @@ export async function runSync(
 
 				if (resolved) {
 					result.conflicts++;
+					onProgress?.("pulling", result);
 				}
 			} else if (remoteChanged && !localChanged) {
-				// Remote is newer, no local changes — just pull
+				// Remote is newer, no local changes: just pull
 				const remoteData = await s3.downloadFile(client, bucket, prefix, path);
 				if (remoteData) {
 					await app.vault.modifyBinary(localFile, remoteData.buffer as ArrayBuffer);
 					result.pulled++;
+					onProgress?.("pulling", result);
 				}
 			}
-			// if localChanged && !remoteChanged — will be pushed in Phase 2
+			// if localChanged && !remoteChanged: will be pushed in Phase 2
 		}
 
 		// --- Phase 2: Push ---
+		onProgress?.("pushing", result);
 		const allFiles = app.vault.getFiles();
 		const updatedManifest: SyncManifest = {
 			...remoteManifest,
@@ -152,7 +166,7 @@ export async function runSync(
 			const existing = updatedManifest.files[path];
 
 			if (!existing) {
-				// New file — upload
+				// New file: upload
 				await s3.uploadFile(client, bucket, prefix, path, localData);
 				await s3.putAncestor(client, bucket, prefix, localHash, localData);
 				updatedManifest.files[path] = {
@@ -166,8 +180,9 @@ export async function runSync(
 					deleted: false,
 				};
 				result.pushed++;
+				onProgress?.("pushing", result);
 			} else if (!existing.deleted && localHash !== existing.sha256) {
-				// Modified — upload
+				// Modified: upload
 				await s3.uploadFile(client, bucket, prefix, path, localData);
 				await s3.putAncestor(client, bucket, prefix, localHash, localData);
 				updatedManifest.files[path] = {
@@ -180,6 +195,7 @@ export async function runSync(
 					version: existing.version + 1,
 				};
 				result.pushed++;
+				onProgress?.("pushing", result);
 			}
 		}
 
@@ -191,32 +207,54 @@ export async function runSync(
 
 			const localFile = app.vault.getAbstractFileByPath(normalizePath(path));
 			if (!localFile) {
-				// File was deleted locally — soft delete on S3
-				await s3.softDeleteFile(client, bucket, prefix, path, deviceName);
+				const now = Date.now();
+				// If cached manifest already recorded this deletion, skip the S3
+				// object operations (already done) and just re-mark in the manifest
+				// to push the deletion upstream again (remote may be stale).
+				const alreadyCached = cachedManifest.files[path]?.deleted === true;
+				if (!alreadyCached) {
+					try {
+						await s3.softDeleteFile(client, bucket, prefix, path, deviceName);
+					} catch (e: any) {
+						result.errors.push(`Delete ${path}: ${e.message}`);
+						continue;
+					}
+				}
 				updatedManifest.files[path] = {
 					...entry,
 					deleted: true,
 					deletedBy: deviceName,
-					deletedAt: Date.now(),
+					deletedAt: cachedManifest.files[path]?.deletedAt ?? now,
 					version: entry.version + 1,
 					lastSyncedBy: deviceName,
-					lastSyncedAt: Date.now(),
+					lastSyncedAt: now,
 				};
 				result.pushed++;
+				onProgress?.("pushing", result);
 			}
 		}
 
 		// --- Phase 3: Upload manifest ---
+		onProgress?.("finalizing", result);
 		// Re-check for concurrent changes
 		const recheckManifest = await s3.getManifest(client, bucket, prefix);
 		if (
 			recheckManifest &&
 			recheckManifest.lastUpdated !== remoteManifest.lastUpdated
 		) {
-			// Another device synced concurrently — merge manifests
+			// Another device synced concurrently: merge manifests
 			for (const [path, entry] of Object.entries(recheckManifest.files)) {
 				const ours = updatedManifest.files[path];
 				if (!ours || entry.version > ours.version) {
+					// Don't let a concurrent re-upload overwrite our deletion if our
+					// deletion is more recent than the other device's last sync.
+					if (
+						ours?.deleted &&
+						!entry.deleted &&
+						(ours.deletedAt ?? 0) > (entry.lastSyncedAt ?? 0)
+					) {
+						continue;
+					}
 					updatedManifest.files[path] = entry;
 				}
 			}
@@ -257,7 +295,7 @@ async function resolveConflict(
 			const merged = mergeMarkdown(ours, ancestor, theirs);
 
 			if (merged.success) {
-				// Clean merge — write result
+				// Clean merge: write result
 				const file = app.vault.getAbstractFileByPath(normalizePath(path));
 				if (file instanceof TFile) {
 					await app.vault.modify(file, merged.content);
@@ -265,7 +303,7 @@ async function resolveConflict(
 					return true;
 				}
 			}
-			// Merge had conflicts — fall through to keep-both
+			// Merge had conflicts: fall through to keep-both
 		}
 	}
 
