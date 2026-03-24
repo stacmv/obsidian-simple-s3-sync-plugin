@@ -66,15 +66,15 @@ BUMP ?= patch
 release: lint test build
 	@echo "Bumping $(BUMP) version from $(VERSION)..."
 	node scripts/bump-version.mjs $(BUMP)
-	$(eval NEW_VERSION := $(shell node -p "require('./package.json').version"))
-	git add package.json manifest.json versions.json
-	git commit -m "chore: release v$(NEW_VERSION)"
-	git tag -a "$(NEW_VERSION)" -m "v$(NEW_VERSION)"
-	git push origin HEAD --tags
-	gh release create "$(NEW_VERSION)" main.js manifest.json \
-		--title "v$(NEW_VERSION)" \
-		--notes "Release v$(NEW_VERSION)"
-	@echo "Released v$(NEW_VERSION)"
+	@NEW_VERSION=$$(node -p "require('./package.json').version"); \
+	git add package.json manifest.json versions.json; \
+	git commit -m "chore: release v$$NEW_VERSION"; \
+	git tag -a "$$NEW_VERSION" -m "v$$NEW_VERSION"; \
+	git push origin HEAD --tags; \
+	gh release create "$$NEW_VERSION" main.js manifest.json \
+		--title "v$$NEW_VERSION" \
+		--notes "Release v$$NEW_VERSION"; \
+	echo "Released v$$NEW_VERSION"
 
 # ── Misc ───────────────────────────────────────────────────────────────────────
 
