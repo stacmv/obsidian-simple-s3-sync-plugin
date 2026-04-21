@@ -25,24 +25,39 @@ export interface SyncPlan {
 	entries: SyncPlanEntry[];
 }
 
+export type PlanProgressCallback = (detail: string) => void;
+
 export async function computeSyncPlan(
 	app: App,
 	client: S3Client,
 	settings: S3SyncSettings,
-	cachedManifest: SyncManifest
+	cachedManifest: SyncManifest,
+	onProgress?: PlanProgressCallback
 ): Promise<SyncPlan> {
 	const { s3Bucket: bucket, s3Prefix: prefix } = settings;
 	const entries: SyncPlanEntry[] = [];
 	const planned = new Set<string>();
 
+	onProgress?.("Fetching remote state...");
+
 	const remoteManifest =
 		(await s3.getManifest(client, bucket, prefix)) ??
 		createEmptyManifest(settings.deviceName);
 
+	// Pre-count files to compare for progress reporting
+	const remoteEntries = Object.entries(remoteManifest.files).filter(
+		([path]) => shouldSyncFile(path, settings.includePatterns, settings.excludePatterns)
+	);
+	const localFiles = app.vault.getFiles().filter(
+		(f) => shouldSyncFile(f.path, settings.includePatterns, settings.excludePatterns)
+	);
+	const totalFiles = remoteEntries.length + localFiles.length;
+	let compared = 0;
+
 	// Check every file known to remote
-	for (const [path, remote] of Object.entries(remoteManifest.files)) {
-		if (!shouldSyncFile(path, settings.includePatterns, settings.excludePatterns))
-			continue;
+	for (const [path, remote] of remoteEntries) {
+		compared++;
+		onProgress?.(`Comparing files ${compared} / ${totalFiles}`);
 
 		const cached = cachedManifest.files[path];
 		const localFile = app.vault.getAbstractFileByPath(normalizePath(path));
@@ -98,10 +113,11 @@ export async function computeSyncPlan(
 	}
 
 	// Check local files not yet covered
-	for (const file of app.vault.getFiles()) {
+	for (const file of localFiles) {
+		compared++;
+		onProgress?.(`Comparing files ${compared} / ${totalFiles}`);
+
 		const path = file.path;
-		if (!shouldSyncFile(path, settings.includePatterns, settings.excludePatterns))
-			continue;
 		if (planned.has(path)) continue;
 
 		const remote = remoteManifest.files[path];

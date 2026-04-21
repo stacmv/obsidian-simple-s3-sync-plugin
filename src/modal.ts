@@ -6,7 +6,6 @@ import type { SyncAction, SyncPlan, SyncPlanEntry } from "./plan";
 import type { SyncResult } from "./sync";
 import { computeSyncPlan } from "./plan";
 import { runSync, SyncCancelledError } from "./sync";
-import { createEmptyManifest } from "./manifest";
 
 // ---------------------------------------------------------------------------
 // Shared constants
@@ -167,8 +166,13 @@ export class SyncProgressModal extends Modal {
 				this.app,
 				this.client,
 				this.settings,
-				this.cachedManifest
+				this.cachedManifest,
+				(detail) => {
+					this.stepDetail = detail;
+					this.renderDetail();
+				}
 			);
+			this.stepDetail = "";
 			this.state = "confirming";
 			this.currentStep = 1;
 			this.render();
@@ -265,7 +269,7 @@ export class SyncProgressModal extends Modal {
 		if (!this.detailEl) return;
 		this.detailEl.empty();
 
-		if (this.state === "syncing" && this.stepDetail) {
+		if ((this.state === "planning" || this.state === "syncing") && this.stepDetail) {
 			this.detailEl.setText(this.stepDetail);
 			if (this.result) {
 				const counts = this.formatCounts(this.result);
