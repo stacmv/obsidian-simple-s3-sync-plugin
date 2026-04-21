@@ -1,7 +1,7 @@
 {
 	"id": "simple-s3-sync",
 	"name": "Simple S3 Sync",
-	"version": "0.2.0",
+	"version": "0.3.0",
 	"minAppVersion": "1.5.0",
 	"description": "Minimal S3-based vault sync with per-device filters and conflict resolution",
 	"author": "Stac",
