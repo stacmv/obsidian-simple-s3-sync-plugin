@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-simple-s3-sync",
-	"version": "0.3.0",
+	"version": "0.3.1",
 	"description": "Simple S3 Sync — minimal Obsidian sync plugin via S3",
 	"main": "main.js",
 	"scripts": {
