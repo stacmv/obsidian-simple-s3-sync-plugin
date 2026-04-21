@@ -53,7 +53,7 @@ local-install: build
 ifndef OBSIDIAN_PLUGIN_DIR
 	$(error OBSIDIAN_PLUGIN_DIR is not set — create a .env file with OBSIDIAN_PLUGIN_DIR=<path>)
 endif
-	cp main.js manifest.json "$(OBSIDIAN_PLUGIN_DIR)/"
+	cp main.js manifest.json styles.css "$(OBSIDIAN_PLUGIN_DIR)/"
 	@echo "Installed v$(VERSION) to $(OBSIDIAN_PLUGIN_DIR)"
 
 # ── Release ────────────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ release: lint test build
 	git commit -m "chore: release v$$NEW_VERSION"; \
 	git tag -a "$$NEW_VERSION" -m "v$$NEW_VERSION"; \
 	git push origin HEAD --tags; \
-	gh release create "$$NEW_VERSION" main.js manifest.json \
+	gh release create "$$NEW_VERSION" main.js manifest.json styles.css \
 		--title "v$$NEW_VERSION" \
 		--notes "Release v$$NEW_VERSION"; \
 	echo "Released v$$NEW_VERSION"

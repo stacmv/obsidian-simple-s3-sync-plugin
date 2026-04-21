@@ -1,0 +1,162 @@
+/* ==========================================================================
+   S3 Sync Progress Modal
+   ========================================================================== */
+
+.s3-sync-progress-modal {
+	max-width: 500px;
+}
+
+/* Step list --------------------------------------------------------------- */
+
+.s3-step-list {
+	margin: 12px 0;
+}
+
+.s3-step {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	padding: 4px 0;
+	font-size: 14px;
+	line-height: 1.4;
+}
+
+.s3-step-icon {
+	flex-shrink: 0;
+	width: 20px;
+	text-align: center;
+	font-weight: 600;
+}
+
+/* Done */
+.s3-step-done .s3-step-icon {
+	color: var(--text-success);
+}
+
+/* Active — spinner */
+.s3-step-active .s3-step-icon {
+	animation: s3-spin 1s linear infinite;
+	color: var(--text-accent);
+}
+
+.s3-step-active .s3-step-label {
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+/* Pending */
+.s3-step-pending .s3-step-label {
+	color: var(--text-muted);
+}
+
+.s3-step-pending .s3-step-icon {
+	color: var(--text-faint);
+}
+
+/* Error */
+.s3-step-error .s3-step-icon {
+	color: var(--text-error);
+}
+
+.s3-step-error .s3-step-label {
+	color: var(--text-error);
+}
+
+/* Cancelled */
+.s3-step-cancelled .s3-step-icon {
+	color: var(--text-muted);
+}
+
+.s3-step-cancelled .s3-step-label {
+	color: var(--text-muted);
+}
+
+@keyframes s3-spin {
+	from { transform: rotate(0deg); }
+	to   { transform: rotate(360deg); }
+}
+
+/* Detail line ------------------------------------------------------------- */
+
+.s3-step-detail {
+	min-height: 20px;
+	padding: 4px 0 8px 28px;
+	font-size: 12px;
+	color: var(--text-muted);
+}
+
+.s3-step-detail-error {
+	color: var(--text-error);
+}
+
+.s3-step-counts {
+	color: var(--text-faint);
+}
+
+/* Plan content (confirming state) ----------------------------------------- */
+
+.s3-plan-content {
+	max-height: 300px;
+	overflow-y: auto;
+	margin: 8px 0;
+}
+
+.s3-sync-uptodate {
+	color: var(--text-muted);
+	font-style: italic;
+}
+
+.s3-sync-section {
+	margin-bottom: 12px;
+}
+
+.s3-sync-section-header {
+	margin-bottom: 4px;
+}
+
+.s3-sync-section-title {
+	font-weight: 600;
+	font-size: 13px;
+}
+
+.s3-sync-section-hint {
+	color: var(--text-muted);
+	font-size: 12px;
+}
+
+.s3-sync-file-list {
+	list-style: none;
+	padding-left: 0;
+	margin: 0;
+}
+
+.s3-sync-file-list li {
+	font-size: 12px;
+	font-family: var(--font-monospace);
+	padding: 1px 0;
+}
+
+.s3-sync-label {
+	display: inline-block;
+	width: 80px;
+	color: var(--text-muted);
+}
+
+.s3-sync-label-conflict {
+	color: var(--text-error);
+}
+
+.s3-sync-path {
+	color: var(--text-normal);
+}
+
+/* Button row -------------------------------------------------------------- */
+
+.s3-sync-button-row {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	margin-top: 12px;
+	padding-top: 8px;
+	border-top: 1px solid var(--background-modifier-border);
+}

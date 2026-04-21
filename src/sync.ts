@@ -19,7 +19,22 @@ interface LocalCachedManifest {
 	manifest: SyncManifest;
 }
 
-export type SyncProgressCallback = (phase: string, result: SyncResult) => void;
+export type SyncProgressCallback = (
+	step: 3 | 4 | 5 | 6,
+	detail: string,
+	result: SyncResult
+) => void;
+
+export class SyncCancelledError extends Error {
+	constructor() {
+		super("Sync cancelled");
+		this.name = "SyncCancelledError";
+	}
+}
+
+function checkAborted(signal?: AbortSignal) {
+	if (signal?.aborted) throw new SyncCancelledError();
+}
 
 export async function runSync(
 	app: App,
@@ -27,11 +42,16 @@ export async function runSync(
 	settings: S3SyncSettings,
 	cachedData: LocalCachedManifest | null,
 	saveCachedData: (data: LocalCachedManifest) => Promise<void>,
-	onProgress?: SyncProgressCallback
+	onProgress?: SyncProgressCallback,
+	signal?: AbortSignal
 ): Promise<SyncResult> {
 	const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
 	const { s3Bucket: bucket, s3Prefix: prefix, deviceName } = settings;
-	// --- Lock ---
+
+	// --- Step 3: Acquire lock ---
+	onProgress?.(3, "Checking lock...", result);
+	checkAborted(signal);
+
 	const existingLock = await s3.getLock(client, bucket, prefix);
 	if (existingLock && !isLockStale(existingLock)) {
 		throw new Error(
@@ -44,17 +64,27 @@ export async function runSync(
 	});
 
 	try {
-		// --- Phase 1: Pull ---
-		onProgress?.("pulling", result);
+		// --- Step 4: Pull ---
+		onProgress?.(4, "Fetching remote state...", result);
+		checkAborted(signal);
+
 		const remoteManifest =
 			(await s3.getManifest(client, bucket, prefix)) ??
 			createEmptyManifest(deviceName);
 
 		const cachedManifest = cachedData?.manifest ?? createEmptyManifest(deviceName);
 
-		for (const [path, remote] of Object.entries(remoteManifest.files)) {
-			if (!shouldSyncFile(path, settings.includePatterns, settings.excludePatterns))
-				continue;
+		// Pre-count pull candidates for progress
+		const pullEntries = Object.entries(remoteManifest.files).filter(
+			([path]) => shouldSyncFile(path, settings.includePatterns, settings.excludePatterns)
+		);
+		const pullTotal = pullEntries.length;
+		let pullIndex = 0;
+
+		for (const [path, remote] of pullEntries) {
+			checkAborted(signal);
+			pullIndex++;
+			onProgress?.(4, `Pulling ${pullIndex} / ${pullTotal}`, result);
 
 			const cached = cachedManifest.files[path];
 			const localFile = app.vault.getAbstractFileByPath(normalizePath(path));
@@ -65,7 +95,6 @@ export async function runSync(
 					try {
 						await app.vault.trash(localFile, true);
 						result.pulled++;
-						onProgress?.("pulling", result);
 					} catch (e: any) {
 						result.errors.push(`Delete ${path}: ${e.message}`);
 					}
@@ -90,7 +119,6 @@ export async function runSync(
 					}
 					await app.vault.createBinary(normalizePath(path), data.buffer as ArrayBuffer);
 					result.pulled++;
-					onProgress?.("pulling", result);
 				}
 				continue;
 			}
@@ -133,7 +161,6 @@ export async function runSync(
 
 				if (resolved) {
 					result.conflicts++;
-					onProgress?.("pulling", result);
 				}
 			} else if (remoteChanged && !localChanged) {
 				// Remote is newer, no local changes: just pull
@@ -141,25 +168,32 @@ export async function runSync(
 				if (remoteData) {
 					await app.vault.modifyBinary(localFile, remoteData.buffer as ArrayBuffer);
 					result.pulled++;
-					onProgress?.("pulling", result);
 				}
 			}
 			// if localChanged && !remoteChanged: will be pushed in Phase 2
 		}
 
-		// --- Phase 2: Push ---
-		onProgress?.("pushing", result);
+		// --- Step 5: Push ---
+		checkAborted(signal);
 		const allFiles = app.vault.getFiles();
 		const updatedManifest: SyncManifest = {
 			...remoteManifest,
 			files: { ...remoteManifest.files },
 		};
 
-		for (const file of allFiles) {
-			const path = file.path;
-			if (!shouldSyncFile(path, settings.includePatterns, settings.excludePatterns))
-				continue;
+		// Pre-count push candidates
+		const pushFiles = allFiles.filter(
+			(f) => shouldSyncFile(f.path, settings.includePatterns, settings.excludePatterns)
+		);
+		const pushTotal = pushFiles.length;
+		let pushIndex = 0;
 
+		for (const file of pushFiles) {
+			checkAborted(signal);
+			pushIndex++;
+			onProgress?.(5, `Pushing ${pushIndex} / ${pushTotal}`, result);
+
+			const path = file.path;
 			const localData = new Uint8Array(await app.vault.readBinary(file));
 			const localHash = await sha256(localData.buffer as ArrayBuffer);
 
@@ -180,7 +214,6 @@ export async function runSync(
 					deleted: false,
 				};
 				result.pushed++;
-				onProgress?.("pushing", result);
 			} else if (!existing.deleted && localHash !== existing.sha256) {
 				// Modified: upload
 				await s3.uploadFile(client, bucket, prefix, path, localData);
@@ -195,12 +228,12 @@ export async function runSync(
 					version: existing.version + 1,
 				};
 				result.pushed++;
-				onProgress?.("pushing", result);
 			}
 		}
 
 		// Check for locally deleted files
 		for (const [path, entry] of Object.entries(updatedManifest.files)) {
+			checkAborted(signal);
 			if (entry.deleted) continue;
 			if (!shouldSyncFile(path, settings.includePatterns, settings.excludePatterns))
 				continue;
@@ -208,9 +241,6 @@ export async function runSync(
 			const localFile = app.vault.getAbstractFileByPath(normalizePath(path));
 			if (!localFile) {
 				const now = Date.now();
-				// If cached manifest already recorded this deletion, skip the S3
-				// object operations (already done) and just re-mark in the manifest
-				// to push the deletion upstream again (remote may be stale).
 				const alreadyCached = cachedManifest.files[path]?.deleted === true;
 				if (!alreadyCached) {
 					try {
@@ -230,12 +260,13 @@ export async function runSync(
 					lastSyncedAt: now,
 				};
 				result.pushed++;
-				onProgress?.("pushing", result);
 			}
 		}
 
-		// --- Phase 3: Upload manifest ---
-		onProgress?.("finalizing", result);
+		// --- Step 6: Finalize ---
+		onProgress?.(6, "Writing manifest...", result);
+		checkAborted(signal);
+
 		// Re-check for concurrent changes
 		const recheckManifest = await s3.getManifest(client, bucket, prefix);
 		if (
@@ -246,8 +277,6 @@ export async function runSync(
 			for (const [path, entry] of Object.entries(recheckManifest.files)) {
 				const ours = updatedManifest.files[path];
 				if (!ours || entry.version > ours.version) {
-					// Don't let a concurrent re-upload overwrite our deletion if our
-					// deletion is more recent than the other device's last sync.
 					if (
 						ours?.deleted &&
 						!entry.deleted &&

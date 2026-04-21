@@ -2,8 +2,7 @@ import { Notice, Plugin } from "obsidian";
 import { S3SyncSettings, DEFAULT_SETTINGS, S3SyncSettingTab } from "./settings";
 import { createS3Client } from "./s3";
 import { runSync, SyncResult } from "./sync";
-import { computeSyncPlan } from "./plan";
-import { SyncPlanModal } from "./modal";
+import { SyncProgressModal } from "./modal";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { SyncManifest } from "./manifest";
 import { createEmptyManifest } from "./manifest";
@@ -23,15 +22,15 @@ export default class SimpleS3SyncPlugin extends Plugin {
 		await this.loadSettings();
 		this.initS3Client();
 
-		// Manual sync: show preview modal first
+		// Manual sync: open progress modal immediately
 		this.addRibbonIcon("refresh-cw", "Simple S3 Sync", () =>
-			this.doSyncWithPreview()
+			this.doSync()
 		);
 
 		this.addCommand({
 			id: "sync-now",
 			name: "Sync now",
-			callback: () => this.doSyncWithPreview(),
+			callback: () => this.doSync(),
 		});
 
 		this.addSettingTab(new S3SyncSettingTab(this.app, this));
@@ -81,15 +80,15 @@ export default class SimpleS3SyncPlugin extends Plugin {
 		}
 		if (this.settings.syncIntervalMinutes > 0) {
 			this.intervalId = window.setInterval(
-				// Auto sync runs silently without preview modal
-				() => this.doSyncDirect(),
+				// Auto sync runs silently without modal
+				() => this.doSyncSilent(),
 				this.settings.syncIntervalMinutes * 60 * 1000
 			);
 		}
 	}
 
-	/** Manual sync: compute plan and show preview modal, then execute on confirm. */
-	private async doSyncWithPreview() {
+	/** Manual sync: open progress modal that handles the full lifecycle. */
+	private async doSync() {
 		if (!this.s3Client) {
 			new Notice("Simple S3 Sync: configure S3 settings first");
 			return;
@@ -99,53 +98,40 @@ export default class SimpleS3SyncPlugin extends Plugin {
 			return;
 		}
 		this.syncing = true;
-		const statusBar = this.addStatusBarItem();
-		statusBar.setText("S3 Sync: checking for changes...");
 
-		try {
-			const fullData = await this.loadFullData();
-			const cachedManifest =
-				fullData.localManifest?.manifest ??
-				createEmptyManifest(this.settings.deviceName);
-			const plan = await computeSyncPlan(
-				this.app,
-				this.s3Client,
-				this.settings,
-				cachedManifest
-			);
-			statusBar.remove();
-			this.syncing = false;
+		const fullData = await this.loadFullData();
+		const cachedManifest =
+			fullData.localManifest?.manifest ??
+			createEmptyManifest(this.settings.deviceName);
 
-			new SyncPlanModal(this.app, plan, () => this.doSyncDirect()).open();
-		} catch (e: any) {
-			new Notice(`S3 Sync failed: ${e.message}`);
-			console.error("S3 Sync error:", e);
-			this.syncing = false;
-			statusBar.remove();
-		}
+		new SyncProgressModal(
+			this.app,
+			this.s3Client,
+			this.settings,
+			cachedManifest,
+			async (cached) => {
+				fullData.localManifest = cached;
+				await this.saveData(fullData);
+			},
+			(result) => {
+				this.syncing = false;
+				if (result?.errors.length) {
+					console.error("S3 Sync errors:", result.errors);
+				}
+			}
+		).open();
 	}
 
-	/** Execute sync directly (used by auto-interval and after modal confirmation). */
-	async doSyncDirect() {
-		if (!this.s3Client) {
-			new Notice("Simple S3 Sync: configure S3 settings first");
-			return;
-		}
-		if (this.syncing) {
-			new Notice("Sync already in progress");
-			return;
-		}
+	/** Silent sync for auto-interval (no modal, status bar only). */
+	async doSyncSilent() {
+		if (!this.s3Client) return;
+		if (this.syncing) return;
 		this.syncing = true;
 		const statusBar = this.addStatusBarItem();
 		statusBar.setText("S3 Sync: connecting...");
 
-		const updateStatusBar = (phase: string, r: SyncResult) => {
-			const counts: string[] = [];
-			if (r.pulled) counts.push(`${r.pulled} downloaded`);
-			if (r.pushed) counts.push(`${r.pushed} uploaded`);
-			if (r.conflicts) counts.push(`${r.conflicts} conflicts`);
-			const label = counts.length ? counts.join(", ") : "...";
-			statusBar.setText(`S3 Sync ${phase}: ${label}`);
+		const updateStatusBar = (step: 3 | 4 | 5 | 6, detail: string, r: SyncResult) => {
+			statusBar.setText(`S3 Sync: ${detail}`);
 		};
 
 		try {
