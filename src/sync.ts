@@ -3,6 +3,7 @@ import type { S3Client } from "@aws-sdk/client-s3";
 import type { S3SyncSettings } from "./settings";
 import type { SyncManifest } from "./manifest";
 import { createEmptyManifest, isLockStale } from "./manifest";
+import type { HashCache } from "./plan";
 import { shouldSyncFile } from "./filter";
 import { sha256 } from "./hash";
 import { mergeMarkdown } from "./merge";
@@ -36,6 +37,19 @@ function checkAborted(signal?: AbortSignal) {
 	if (signal?.aborted) throw new SyncCancelledError();
 }
 
+async function getHash(
+	app: App,
+	file: TFile,
+	cache?: HashCache
+): Promise<{ hash: string; data: Uint8Array }> {
+	const cached = cache?.get(file.path);
+	const data = new Uint8Array(await app.vault.readBinary(file));
+	if (cached) return { hash: cached, data };
+	const hash = await sha256(data.buffer as ArrayBuffer);
+	cache?.set(file.path, hash);
+	return { hash, data };
+}
+
 export async function runSync(
 	app: App,
 	client: S3Client,
@@ -43,7 +57,8 @@ export async function runSync(
 	cachedData: LocalCachedManifest | null,
 	saveCachedData: (data: LocalCachedManifest) => Promise<void>,
 	onProgress?: SyncProgressCallback,
-	signal?: AbortSignal
+	signal?: AbortSignal,
+	hashCache?: HashCache
 ): Promise<SyncResult> {
 	const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
 	const { s3Bucket: bucket, s3Prefix: prefix, deviceName } = settings;
@@ -74,7 +89,6 @@ export async function runSync(
 
 		const cachedManifest = cachedData?.manifest ?? createEmptyManifest(deviceName);
 
-		// Pre-count pull candidates for progress
 		const pullEntries = Object.entries(remoteManifest.files).filter(
 			([path]) => shouldSyncFile(path, settings.includePatterns, settings.excludePatterns)
 		);
@@ -84,7 +98,7 @@ export async function runSync(
 		for (const [path, remote] of pullEntries) {
 			checkAborted(signal);
 			pullIndex++;
-			onProgress?.(4, `Pulling ${pullIndex} / ${pullTotal}`, result);
+			onProgress?.(4, `Checking remote ${pullIndex} / ${pullTotal}`, result);
 
 			const cached = cachedManifest.files[path];
 			const localFile = app.vault.getAbstractFileByPath(normalizePath(path));
@@ -132,8 +146,7 @@ export async function runSync(
 			if (remoteVersion <= cachedVersion) continue; // no remote change
 
 			// Remote has a newer version: check for conflict
-			const localData = new Uint8Array(await app.vault.readBinary(localFile));
-			const localHash = await sha256(localData.buffer as ArrayBuffer);
+			const { hash: localHash, data: localData } = await getHash(app, localFile, hashCache);
 			const cachedHash = cached?.sha256 ?? "";
 
 			if (localHash === remote.sha256) {
@@ -181,7 +194,6 @@ export async function runSync(
 			files: { ...remoteManifest.files },
 		};
 
-		// Pre-count push candidates
 		const pushFiles = allFiles.filter(
 			(f) => shouldSyncFile(f.path, settings.includePatterns, settings.excludePatterns)
 		);
@@ -191,16 +203,16 @@ export async function runSync(
 		for (const file of pushFiles) {
 			checkAborted(signal);
 			pushIndex++;
-			onProgress?.(5, `Pushing ${pushIndex} / ${pushTotal}`, result);
+			onProgress?.(5, `Checking local ${pushIndex} / ${pushTotal}`, result);
 
 			const path = file.path;
-			const localData = new Uint8Array(await app.vault.readBinary(file));
-			const localHash = await sha256(localData.buffer as ArrayBuffer);
+			const { hash: localHash, data: localData } = await getHash(app, file, hashCache);
 
 			const existing = updatedManifest.files[path];
 
 			if (!existing) {
 				// New file: upload
+				onProgress?.(5, `Uploading ${path}`, result);
 				await s3.uploadFile(client, bucket, prefix, path, localData);
 				await s3.putAncestor(client, bucket, prefix, localHash, localData);
 				updatedManifest.files[path] = {
@@ -216,6 +228,7 @@ export async function runSync(
 				result.pushed++;
 			} else if (!existing.deleted && localHash !== existing.sha256) {
 				// Modified: upload
+				onProgress?.(5, `Uploading ${path}`, result);
 				await s3.uploadFile(client, bucket, prefix, path, localData);
 				await s3.putAncestor(client, bucket, prefix, localHash, localData);
 				updatedManifest.files[path] = {

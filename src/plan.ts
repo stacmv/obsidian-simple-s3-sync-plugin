@@ -21,8 +21,11 @@ export interface SyncPlanEntry {
 	action: SyncAction;
 }
 
+export type HashCache = Map<string, string>;
+
 export interface SyncPlan {
 	entries: SyncPlanEntry[];
+	hashCache: HashCache;
 }
 
 export type PlanProgressCallback = (detail: string) => void;
@@ -36,6 +39,7 @@ export async function computeSyncPlan(
 ): Promise<SyncPlan> {
 	const { s3Bucket: bucket, s3Prefix: prefix } = settings;
 	const entries: SyncPlanEntry[] = [];
+	const hashCache: HashCache = new Map();
 	const planned = new Set<string>();
 
 	onProgress?.("Fetching remote state...");
@@ -94,6 +98,7 @@ export async function computeSyncPlan(
 
 		const localData = new Uint8Array(await app.vault.readBinary(localFile));
 		const localHash = await sha256(localData.buffer as ArrayBuffer);
+		hashCache.set(path, localHash);
 
 		if (localHash === remote.sha256) continue; // identical content
 
@@ -127,6 +132,7 @@ export async function computeSyncPlan(
 			// In remote but hash mismatch not caught above — check for local modification
 			const localData = new Uint8Array(await app.vault.readBinary(file));
 			const localHash = await sha256(localData.buffer as ArrayBuffer);
+			hashCache.set(path, localHash);
 			const cachedHash = cachedManifest.files[path]?.sha256 ?? "";
 			if (localHash !== remote.sha256 && localHash !== cachedHash) {
 				entries.push({ path, action: "upload-update" });
@@ -134,5 +140,5 @@ export async function computeSyncPlan(
 		}
 	}
 
-	return { entries };
+	return { entries, hashCache };
 }

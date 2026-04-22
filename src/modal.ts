@@ -2,7 +2,7 @@ import { App, Modal } from "obsidian";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { S3SyncSettings } from "./settings";
 import type { SyncManifest } from "./manifest";
-import type { SyncAction, SyncPlan, SyncPlanEntry } from "./plan";
+import type { SyncAction, SyncPlan, SyncPlanEntry, HashCache } from "./plan";
 import type { SyncResult } from "./sync";
 import { computeSyncPlan } from "./plan";
 import { runSync, SyncCancelledError } from "./sync";
@@ -89,6 +89,7 @@ export class SyncProgressModal extends Modal {
 	private currentStep = 0; // 0-based index into STEPS
 	private stepDetail = "";
 	private plan: SyncPlan | null = null;
+	private hashCache: HashCache | null = null;
 	private result: SyncResult | null = null;
 	private errorMessage = "";
 
@@ -172,6 +173,7 @@ export class SyncProgressModal extends Modal {
 					this.renderDetail();
 				}
 			);
+			this.hashCache = this.plan.hashCache;
 			this.stepDetail = "";
 			this.state = "confirming";
 			this.currentStep = 1;
@@ -203,7 +205,8 @@ export class SyncProgressModal extends Modal {
 					this.result = result;
 					this.render();
 				},
-				this.abortController.signal
+				this.abortController.signal,
+				this.hashCache ?? undefined
 			);
 
 			this.state = "done";
