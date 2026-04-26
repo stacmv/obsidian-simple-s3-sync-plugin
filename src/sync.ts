@@ -37,15 +37,28 @@ function checkAborted(signal?: AbortSignal) {
 	if (signal?.aborted) throw new SyncCancelledError();
 }
 
-async function getHash(
+// Returns hash only — uses cache, reads file only on miss. No unnecessary disk I/O.
+async function getHashOnly(
+	app: App,
+	file: TFile,
+	cache?: HashCache
+): Promise<string> {
+	const cached = cache?.get(file.path);
+	if (cached) return cached;
+	const data = new Uint8Array(await app.vault.readBinary(file));
+	const hash = await sha256(data.buffer as ArrayBuffer);
+	cache?.set(file.path, hash);
+	return hash;
+}
+
+// Returns hash + data — used when we know we'll need the file content (conflicts, uploads).
+async function getHashAndData(
 	app: App,
 	file: TFile,
 	cache?: HashCache
 ): Promise<{ hash: string; data: Uint8Array }> {
-	const cached = cache?.get(file.path);
 	const data = new Uint8Array(await app.vault.readBinary(file));
-	if (cached) return { hash: cached, data };
-	const hash = await sha256(data.buffer as ArrayBuffer);
+	const hash = cache?.get(file.path) ?? await sha256(data.buffer as ArrayBuffer);
 	cache?.set(file.path, hash);
 	return { hash, data };
 }
@@ -146,7 +159,7 @@ export async function runSync(
 			if (remoteVersion <= cachedVersion) continue; // no remote change
 
 			// Remote has a newer version: check for conflict
-			const { hash: localHash, data: localData } = await getHash(app, localFile, hashCache);
+			const { hash: localHash, data: localData } = await getHashAndData(app, localFile, hashCache);
 			const cachedHash = cached?.sha256 ?? "";
 
 			if (localHash === remote.sha256) {
@@ -206,40 +219,36 @@ export async function runSync(
 			onProgress?.(5, `Checking local ${pushIndex} / ${pushTotal}`, result);
 
 			const path = file.path;
-			const { hash: localHash, data: localData } = await getHash(app, file, hashCache);
-
+			const localHash = await getHashOnly(app, file, hashCache);
 			const existing = updatedManifest.files[path];
+			const needsUpload = !existing || (!existing.deleted && localHash !== existing.sha256);
 
-			if (!existing) {
-				// New file: upload
+			if (needsUpload) {
 				onProgress?.(5, `Uploading ${path}`, result);
+				// Read file data only now that we know an upload is needed
+				const { data: localData } = await getHashAndData(app, file, hashCache);
 				await s3.uploadFile(client, bucket, prefix, path, localData);
 				await s3.putAncestor(client, bucket, prefix, localHash, localData);
-				updatedManifest.files[path] = {
-					path,
-					sha256: localHash,
-					mtimeMs: file.stat.mtime,
-					sizeBytes: file.stat.size,
-					lastSyncedBy: deviceName,
-					lastSyncedAt: Date.now(),
-					version: 1,
-					deleted: false,
-				};
-				result.pushed++;
-			} else if (!existing.deleted && localHash !== existing.sha256) {
-				// Modified: upload
-				onProgress?.(5, `Uploading ${path}`, result);
-				await s3.uploadFile(client, bucket, prefix, path, localData);
-				await s3.putAncestor(client, bucket, prefix, localHash, localData);
-				updatedManifest.files[path] = {
-					...existing,
-					sha256: localHash,
-					mtimeMs: file.stat.mtime,
-					sizeBytes: file.stat.size,
-					lastSyncedBy: deviceName,
-					lastSyncedAt: Date.now(),
-					version: existing.version + 1,
-				};
+				updatedManifest.files[path] = existing
+					? {
+						...existing,
+						sha256: localHash,
+						mtimeMs: file.stat.mtime,
+						sizeBytes: file.stat.size,
+						lastSyncedBy: deviceName,
+						lastSyncedAt: Date.now(),
+						version: existing.version + 1,
+					}
+					: {
+						path,
+						sha256: localHash,
+						mtimeMs: file.stat.mtime,
+						sizeBytes: file.stat.size,
+						lastSyncedBy: deviceName,
+						lastSyncedAt: Date.now(),
+						version: 1,
+						deleted: false,
+					};
 				result.pushed++;
 			}
 		}

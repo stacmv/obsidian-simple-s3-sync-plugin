@@ -92,6 +92,7 @@ export class SyncProgressModal extends Modal {
 	private hashCache: HashCache | null = null;
 	private result: SyncResult | null = null;
 	private errorMessage = "";
+	private _finished = false;
 
 	private abortController: AbortController | null = null;
 
@@ -117,10 +118,42 @@ export class SyncProgressModal extends Modal {
 		this.onComplete = onComplete;
 	}
 
+	// Called by plugin when user re-triggers sync while this modal is active.
+	bringToFront() {
+		this.modalEl.focus();
+	}
+
+	// Override Modal.close() to:
+	// - Block accidental close (outside click, X button) during planning/syncing
+	// - Ensure onComplete is always called exactly once on legitimate close
+	close() {
+		if (this.state === "planning" || this.state === "syncing") {
+			// Must use the Cancel button; outside click and X are ignored
+			return;
+		}
+		this.finish();
+		super.close();
+	}
+
+	onClose() {
+		this.abortController?.abort();
+		this.contentEl.empty();
+	}
+
+	// Calls onComplete exactly once regardless of close path
+	private finish() {
+		if (this._finished) return;
+		this._finished = true;
+		this.onComplete(this.state === "done" ? this.result : null);
+	}
+
 	async onOpen() {
 		const { contentEl } = this;
 		contentEl.empty();
 		contentEl.addClass("s3-sync-progress-modal");
+
+		// Remove Obsidian's built-in X close button — we control closing
+		this.modalEl.querySelector(".modal-close-button")?.remove();
 
 		contentEl.createEl("h2", { text: "S3 Sync" });
 
@@ -145,12 +178,6 @@ export class SyncProgressModal extends Modal {
 
 		this.render();
 		await this.startPlanning();
-	}
-
-	onClose() {
-		// If still running, abort
-		this.abortController?.abort();
-		this.contentEl.empty();
 	}
 
 	// -----------------------------------------------------------------------
@@ -359,33 +386,29 @@ export class SyncProgressModal extends Modal {
 			const cancelBtn = this.buttonRow.createEl("button", {
 				text: hasChanges ? "Cancel" : "Close",
 			});
+			// close() is not blocked in confirming state — finish() handles onComplete
+			cancelBtn.addEventListener("click", () => this.close());
+
+		} else if (this.state === "planning") {
+			const cancelBtn = this.buttonRow.createEl("button", { text: "Cancel" });
+			// Planning can't be aborted; override the block just for this explicit cancel
 			cancelBtn.addEventListener("click", () => {
-				this.close();
-				this.onComplete(null);
+				this.finish();
+				super.close();
 			});
-		} else if (this.state === "planning" || this.state === "syncing") {
-			const cancelBtn = this.buttonRow.createEl("button", {
-				text: "Cancel",
-			});
-			cancelBtn.addEventListener("click", () => {
-				this.abortController?.abort();
-				if (this.state === "planning") {
-					// Can't truly cancel computeSyncPlan, just close
-					this.close();
-					this.onComplete(null);
-				}
-				// For syncing state, the catch block will handle state transition
-			});
+
+		} else if (this.state === "syncing") {
+			const cancelBtn = this.buttonRow.createEl("button", { text: "Cancel" });
+			// Abort the sync; catch block transitions state to cancelled, then user clicks Close
+			cancelBtn.addEventListener("click", () => this.abortController?.abort());
+
 		} else {
 			// done, error, cancelled
 			const closeBtn = this.buttonRow.createEl("button", {
 				text: "Close",
 				cls: this.state === "done" ? "mod-cta" : "",
 			});
-			closeBtn.addEventListener("click", () => {
-				this.close();
-				this.onComplete(this.result);
-			});
+			closeBtn.addEventListener("click", () => this.close());
 		}
 	}
 

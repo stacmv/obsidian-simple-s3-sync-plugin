@@ -17,6 +17,7 @@ export default class SimpleS3SyncPlugin extends Plugin {
 	private s3Client: S3Client | null = null;
 	private intervalId: number | null = null;
 	private syncing = false;
+	private activeModal: SyncProgressModal | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -94,7 +95,12 @@ export default class SimpleS3SyncPlugin extends Plugin {
 			return;
 		}
 		if (this.syncing) {
-			new Notice("Sync already in progress");
+			// Sync already running — bring existing modal to front if available
+			if (this.activeModal) {
+				this.activeModal.bringToFront();
+			} else {
+				new Notice("Sync already in progress");
+			}
 			return;
 		}
 		this.syncing = true;
@@ -104,7 +110,7 @@ export default class SimpleS3SyncPlugin extends Plugin {
 			fullData.localManifest?.manifest ??
 			createEmptyManifest(this.settings.deviceName);
 
-		new SyncProgressModal(
+		this.activeModal = new SyncProgressModal(
 			this.app,
 			this.s3Client,
 			this.settings,
@@ -115,11 +121,13 @@ export default class SimpleS3SyncPlugin extends Plugin {
 			},
 			(result) => {
 				this.syncing = false;
+				this.activeModal = null;
 				if (result?.errors.length) {
 					console.error("S3 Sync errors:", result.errors);
 				}
 			}
-		).open();
+		);
+		this.activeModal.open();
 	}
 
 	/** Silent sync for auto-interval (no modal, status bar only). */
