@@ -233,7 +233,8 @@ export class SyncProgressModal extends Modal {
 					this.render();
 				},
 				this.abortController.signal,
-				this.hashCache ?? undefined
+				this.hashCache ?? undefined,
+				this.plan?.remoteManifest
 			);
 
 			this.state = "done";

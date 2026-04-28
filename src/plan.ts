@@ -26,6 +26,7 @@ export type HashCache = Map<string, string>;
 export interface SyncPlan {
 	entries: SyncPlanEntry[];
 	hashCache: HashCache;
+	remoteManifest: SyncManifest;
 }
 
 export type PlanProgressCallback = (detail: string) => void;
@@ -96,11 +97,21 @@ export async function computeSyncPlan(
 
 		if (!(localFile instanceof TFile)) continue;
 
-		const localData = new Uint8Array(await app.vault.readBinary(localFile));
-		const localHash = await sha256(localData.buffer as ArrayBuffer);
+		// mtime pre-filter: if local mtime matches last sync, content is unchanged —
+		// reuse the cached hash and skip the disk read entirely.
+		let localHash: string;
+		if (cached && !cached.deleted && localFile.stat.mtime <= cached.mtimeMs) {
+			localHash = cached.sha256;
+		} else {
+			const localData = new Uint8Array(await app.vault.readBinary(localFile));
+			localHash = await sha256(localData.buffer as ArrayBuffer);
+		}
 		hashCache.set(path, localHash);
 
-		if (localHash === remote.sha256) continue; // identical content
+		if (localHash === remote.sha256) {
+			planned.add(path); // identical — mark planned so local loop skips it
+			continue;
+		}
 
 		const cachedHash = cached?.sha256 ?? "";
 		const localChanged = localHash !== cachedHash;
@@ -129,16 +140,23 @@ export async function computeSyncPlan(
 		if (!remote) {
 			entries.push({ path, action: "upload-new" });
 		} else if (!remote.deleted) {
-			// In remote but hash mismatch not caught above — check for local modification
-			const localData = new Uint8Array(await app.vault.readBinary(file));
-			const localHash = await sha256(localData.buffer as ArrayBuffer);
+			// In remote but not yet planned — check for local modification
+			const cachedEntry = cachedManifest.files[path];
+			let localHash: string;
+			if (cachedEntry && !cachedEntry.deleted && file.stat.mtime <= cachedEntry.mtimeMs) {
+				// mtime unchanged — file is the same as last sync, skip disk read
+				localHash = cachedEntry.sha256;
+			} else {
+				const localData = new Uint8Array(await app.vault.readBinary(file));
+				localHash = await sha256(localData.buffer as ArrayBuffer);
+			}
 			hashCache.set(path, localHash);
-			const cachedHash = cachedManifest.files[path]?.sha256 ?? "";
+			const cachedHash = cachedEntry?.sha256 ?? "";
 			if (localHash !== remote.sha256 && localHash !== cachedHash) {
 				entries.push({ path, action: "upload-update" });
 			}
 		}
 	}
 
-	return { entries, hashCache };
+	return { entries, hashCache, remoteManifest };
 }

@@ -71,7 +71,8 @@ export async function runSync(
 	saveCachedData: (data: LocalCachedManifest) => Promise<void>,
 	onProgress?: SyncProgressCallback,
 	signal?: AbortSignal,
-	hashCache?: HashCache
+	hashCache?: HashCache,
+	cachedRemoteManifest?: SyncManifest
 ): Promise<SyncResult> {
 	const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
 	const { s3Bucket: bucket, s3Prefix: prefix, deviceName } = settings;
@@ -93,10 +94,13 @@ export async function runSync(
 
 	try {
 		// --- Step 4: Pull ---
+		// Use manifest from planning phase if available — avoids a redundant S3 fetch.
+		// The finalize re-check later handles any concurrent changes made in the interim.
 		onProgress?.(4, "Fetching remote state...", result);
 		checkAborted(signal);
 
 		const remoteManifest =
+			cachedRemoteManifest ??
 			(await s3.getManifest(client, bucket, prefix)) ??
 			createEmptyManifest(deviceName);
 
@@ -219,18 +223,38 @@ export async function runSync(
 			onProgress?.(5, `Checking local ${pushIndex} / ${pushTotal}`, result);
 
 			const path = file.path;
-			const localHash = await getHashOnly(app, file, hashCache);
 			const existing = updatedManifest.files[path];
-			const needsUpload = !existing || (!existing.deleted && localHash !== existing.sha256);
 
-			if (needsUpload) {
+			if (!existing) {
+				// New file: read once — use cached hash if available, otherwise hash while reading
+				const localData = new Uint8Array(await app.vault.readBinary(file));
+				const localHash =
+					hashCache?.get(path) ??
+					await sha256(localData.buffer as ArrayBuffer);
+				hashCache?.set(path, localHash);
 				onProgress?.(5, `Uploading ${path}`, result);
-				// Read file data only now that we know an upload is needed
-				const { data: localData } = await getHashAndData(app, file, hashCache);
 				await s3.uploadFile(client, bucket, prefix, path, localData);
 				await s3.putAncestor(client, bucket, prefix, localHash, localData);
-				updatedManifest.files[path] = existing
-					? {
+				updatedManifest.files[path] = {
+					path,
+					sha256: localHash,
+					mtimeMs: file.stat.mtime,
+					sizeBytes: file.stat.size,
+					lastSyncedBy: deviceName,
+					lastSyncedAt: Date.now(),
+					version: 1,
+					deleted: false,
+				};
+				result.pushed++;
+			} else if (!existing.deleted) {
+				// Existing file: hash-only check first (cache hit = zero disk I/O for unchanged files)
+				const localHash = await getHashOnly(app, file, hashCache);
+				if (localHash !== existing.sha256) {
+					onProgress?.(5, `Uploading ${path}`, result);
+					const localData = new Uint8Array(await app.vault.readBinary(file));
+					await s3.uploadFile(client, bucket, prefix, path, localData);
+					await s3.putAncestor(client, bucket, prefix, localHash, localData);
+					updatedManifest.files[path] = {
 						...existing,
 						sha256: localHash,
 						mtimeMs: file.stat.mtime,
@@ -238,18 +262,9 @@ export async function runSync(
 						lastSyncedBy: deviceName,
 						lastSyncedAt: Date.now(),
 						version: existing.version + 1,
-					}
-					: {
-						path,
-						sha256: localHash,
-						mtimeMs: file.stat.mtime,
-						sizeBytes: file.stat.size,
-						lastSyncedBy: deviceName,
-						lastSyncedAt: Date.now(),
-						version: 1,
-						deleted: false,
 					};
-				result.pushed++;
+					result.pushed++;
+				}
 			}
 		}
 
