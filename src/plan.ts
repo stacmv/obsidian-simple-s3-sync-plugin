@@ -119,7 +119,14 @@ export async function computeSyncPlan(
 		const remoteIsNewer = remote.version > (cached?.version ?? 0);
 
 		if (localChanged && remoteChanged) {
-			entries.push({ path, action: "conflict" });
+			if (!cached) {
+				// No local history — device lost its cache (e.g. app reinstall,
+				// Android data cleanup). We can't claim a local "change" without
+				// a baseline, so trust the remote version.
+				entries.push({ path, action: "download-update" });
+			} else {
+				entries.push({ path, action: "conflict" });
+			}
 		} else if (remoteIsNewer && remoteChanged && !localChanged) {
 			entries.push({ path, action: "download-update" });
 		} else if (localChanged && !remoteChanged) {
@@ -153,7 +160,12 @@ export async function computeSyncPlan(
 			hashCache.set(path, localHash);
 			const cachedHash = cachedEntry?.sha256 ?? "";
 			if (localHash !== remote.sha256 && localHash !== cachedHash) {
-				entries.push({ path, action: "upload-update" });
+				if (!cachedEntry) {
+					// No local history — trust remote over untracked local copy
+					entries.push({ path, action: "download-update" });
+				} else {
+					entries.push({ path, action: "upload-update" });
+				}
 			}
 		}
 	}
