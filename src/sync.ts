@@ -77,6 +77,11 @@ export async function runSync(
 	const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
 	const { s3Bucket: bucket, s3Prefix: prefix, deviceName } = settings;
 
+	// Paths whose local file was overwritten with remote content in step 4
+	// (clean pulls and conflict keep-both losers). Step 5 uses this to refresh
+	// their cached mtime without re-uploading.
+	const pulledPaths = new Set<string>();
+
 	// --- Step 3: Acquire lock ---
 	onProgress?.(3, "Checking lock...", result);
 	checkAborted(signal);
@@ -186,10 +191,16 @@ export async function runSync(
 					path,
 					localData,
 					remoteData,
-					cachedHash
+					remote.sha256,
+					cachedHash,
+					hashCache
 				);
 
-				if (resolved) {
+				if (resolved === "kept-both") {
+					// Local file was overwritten with remote content; treat it like a pull.
+					pulledPaths.add(path);
+					result.conflicts++;
+				} else if (resolved === "merged") {
 					result.conflicts++;
 				}
 			} else if (remoteChanged && !localChanged) {
@@ -197,6 +208,11 @@ export async function runSync(
 				const remoteData = await s3.downloadFile(client, bucket, prefix, path);
 				if (remoteData) {
 					await app.vault.modifyBinary(localFile, remoteData.buffer as ArrayBuffer);
+					// Local file is now the remote content; keep hashCache aligned so
+					// the push phase doesn't treat its own write as a local change
+					// (which would corrupt the manifest's recorded sha256).
+					hashCache?.set(path, remote.sha256);
+					pulledPaths.add(path);
 					result.pulled++;
 				}
 			}
@@ -264,6 +280,15 @@ export async function runSync(
 						version: existing.version + 1,
 					};
 					result.pushed++;
+				} else if (pulledPaths.has(path)) {
+					// We just wrote remote content here; bump cached mtimeMs to the
+					// post-write local mtime so the next sync's mtime pre-filter
+					// recognizes the file as unchanged without re-reading it.
+					updatedManifest.files[path] = {
+						...existing,
+						mtimeMs: file.stat.mtime,
+						sizeBytes: file.stat.size,
+					};
 				}
 			}
 		}
@@ -338,6 +363,8 @@ export async function runSync(
 	return result;
 }
 
+type ConflictResolution = "merged" | "kept-both" | null;
+
 async function resolveConflict(
 	app: App,
 	client: S3Client,
@@ -345,8 +372,10 @@ async function resolveConflict(
 	path: string,
 	localData: Uint8Array,
 	remoteData: Uint8Array,
-	ancestorHash: string
-): Promise<boolean> {
+	remoteHash: string,
+	ancestorHash: string,
+	hashCache?: HashCache
+): Promise<ConflictResolution> {
 	const decoder = new TextDecoder();
 	const isMarkdown = path.endsWith(".md");
 	const { s3Bucket: bucket, s3Prefix: prefix, deviceName } = settings;
@@ -365,8 +394,15 @@ async function resolveConflict(
 				const file = app.vault.getAbstractFileByPath(normalizePath(path));
 				if (file instanceof TFile) {
 					await app.vault.modify(file, merged.content);
+					// Keep hashCache aligned with on-disk content so the push phase
+					// uploads the merged content with the correct sha256.
+					const mergedBytes = new TextEncoder().encode(merged.content);
+					hashCache?.set(
+						path,
+						await sha256(mergedBytes.buffer as ArrayBuffer)
+					);
 					new Notice(`Merged: ${path}`);
-					return true;
+					return "merged";
 				}
 			}
 			// Merge had conflicts: fall through to keep-both
@@ -375,7 +411,7 @@ async function resolveConflict(
 
 	// Keep both: write remote as main, local as conflict copy
 	const file = app.vault.getAbstractFileByPath(normalizePath(path));
-	if (!(file instanceof TFile)) return false;
+	if (!(file instanceof TFile)) return null;
 
 	const ts = new Date().toISOString().replace(/[:.]/g, "-");
 	const ext = path.contains(".") ? path.substring(path.lastIndexOf(".")) : "";
@@ -390,11 +426,13 @@ async function resolveConflict(
 		localData.buffer as ArrayBuffer
 	);
 
-	// Overwrite local with remote version
+	// Overwrite local with remote version. Align hashCache to the new on-disk
+	// content so the push phase doesn't see a phantom local change.
 	await app.vault.modifyBinary(file, remoteData.buffer as ArrayBuffer);
+	hashCache?.set(path, remoteHash);
 
 	new Notice(`Conflict: ${path}\nLocal saved as ${conflictPath}`);
-	return true;
+	return "kept-both";
 }
 
 async function ensureDir(app: App, dirPath: string): Promise<void> {
