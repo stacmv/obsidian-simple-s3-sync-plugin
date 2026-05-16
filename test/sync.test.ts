@@ -45,6 +45,7 @@ vi.mock("../src/s3", () => ({
 	}),
 }));
 
+import * as s3 from "../src/s3";
 import { computeSyncPlan } from "../src/plan";
 import { runSync } from "../src/sync";
 
@@ -275,5 +276,209 @@ describe("runSync — hashCache must reflect post-pull file content (regression)
 		// There is genuinely nothing to do — neither device made a real change.
 		const fileEntry = aPlan.entries.find((e) => e.path === "file.md");
 		expect(fileEntry).toBeUndefined();
+	});
+});
+
+describe("runSync — partial failures must not poison cached state (regression)", () => {
+	it("interrupted putManifest leaves pulled files reconciled in cached", async () => {
+		// Scenario: device pulls a remote update, but step 6 putManifest fails.
+		// Before the fix, cached was never written, so the next sync saw the
+		// just-pulled local content as a "local change" and the remote as a
+		// "remote change" — flagging a phantom conflict.
+		const oldContent = "v1";
+		const newContent = "v2";
+		const oldHash = await hashOf(oldContent);
+		const newHash = await hashOf(newContent);
+
+		s3State.files.set("file.md", new TextEncoder().encode(newContent));
+		s3State.manifest = manifest(2000, "peer", [
+			entry({ path: "file.md", sha256: newHash, version: 2, mtimeMs: 2000 }),
+		]);
+
+		const app = makeMockApp([{ path: "file.md", content: oldContent, mtime: 1000 }]);
+		const cachedManifest = manifest(1000, "me", [
+			entry({ path: "file.md", sha256: oldHash, version: 1, mtimeMs: 1000 }),
+		]);
+
+		// Capture every saveCachedData call; we want the last one before failure.
+		const saved: SyncManifest[] = [];
+		const saveCached = async (d: { manifest: SyncManifest }) => {
+			saved.push(JSON.parse(JSON.stringify(d.manifest)));
+		};
+
+		// Inject a network outage at the final manifest write.
+		vi.mocked(s3.putManifest).mockImplementationOnce(async () => {
+			throw new Error("network outage");
+		});
+
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+		await expect(
+			runSync(
+				app as any,
+				{} as any,
+				settings(),
+				{ manifest: cachedManifest },
+				saveCached,
+				undefined,
+				undefined,
+				plan.hashCache,
+				plan.remoteManifest
+			)
+		).rejects.toThrow("network outage");
+
+		// Local file was written during step 4 — it has the new content now.
+		const localFile = app.vault.getAbstractFileByPath("file.md") as any;
+		expect(localFile._content).toBe(newContent);
+
+		// The post-pull checkpoint must have been persisted before the throw.
+		expect(saved.length).toBeGreaterThan(0);
+		const lastSaved = saved[saved.length - 1];
+		expect(lastSaved.files["file.md"].sha256).toBe(newHash);
+
+		// Now run a second sync with the checkpoint as the new cached manifest.
+		// The plan should see nothing to do — local matches remote, no conflict.
+		const plan2 = await computeSyncPlan(app as any, {} as any, settings(), lastSaved);
+		const file2 = plan2.entries.find((e) => e.path === "file.md");
+		expect(file2).toBeUndefined();
+	});
+
+	it("interrupted upload re-attempts the push on the next sync (no phantom conflict)", async () => {
+		// Scenario: user edits a file, upload fails partway. Before the fix,
+		// cached was never saved, so on retry plan would see remote unchanged
+		// (correct) but no conflict — which actually still works for this case.
+		// The real regression is: on retry, the next sync must STILL plan an
+		// upload-update (not skip the file thinking it's already synced) and
+		// must NOT have polluted cached with a sha that doesn't match S3.
+		const oldContent = "original";
+		const newContent = "user edit";
+		const oldHash = await hashOf(oldContent);
+		const newHash = await hashOf(newContent);
+
+		// S3 has old content; user has edited locally.
+		s3State.files.set("file.md", new TextEncoder().encode(oldContent));
+		s3State.manifest = manifest(1000, "me", [
+			entry({ path: "file.md", sha256: oldHash, version: 1, mtimeMs: 1000 }),
+		]);
+
+		// Local file already has the edit (mtime newer than cached).
+		const app = makeMockApp([{ path: "file.md", content: newContent, mtime: 5000 }]);
+		const cachedManifest = manifest(1000, "me", [
+			entry({ path: "file.md", sha256: oldHash, version: 1, mtimeMs: 1000 }),
+		]);
+
+		const saved: SyncManifest[] = [];
+		const saveCached = async (d: { manifest: SyncManifest }) => {
+			saved.push(JSON.parse(JSON.stringify(d.manifest)));
+		};
+
+		// Inject a network outage at uploadFile.
+		vi.mocked(s3.uploadFile).mockImplementationOnce(async () => {
+			throw new Error("network outage");
+		});
+
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+		await expect(
+			runSync(
+				app as any,
+				{} as any,
+				settings(),
+				{ manifest: cachedManifest },
+				saveCached,
+				undefined,
+				undefined,
+				plan.hashCache,
+				plan.remoteManifest
+			)
+		).rejects.toThrow("network outage");
+
+		// Checkpoint saved during step 4's finally must still reflect the OLD
+		// sha for the file (it was a local change, not a pull — not reconciled).
+		expect(saved.length).toBeGreaterThan(0);
+		const lastSaved = saved[saved.length - 1];
+		expect(lastSaved.files["file.md"].sha256).toBe(oldHash);
+
+		// S3 manifest is untouched.
+		expect(s3State.manifest!.files["file.md"].sha256).toBe(oldHash);
+
+		// Next sync must still see the local edit as a pending upload.
+		const plan2 = await computeSyncPlan(app as any, {} as any, settings(), lastSaved);
+		const file2 = plan2.entries.find((e) => e.path === "file.md");
+		expect(file2?.action).toBe("upload-update");
+	});
+
+	it("checkpoint persists pulls that completed before a mid-step-4 failure", async () => {
+		// Two files to pull. The second download fails. The first file must be
+		// reconciled in cached so the next sync doesn't replay its pull as a
+		// phantom conflict.
+		const aContent = "a-remote";
+		const bContent = "b-remote";
+		const aHash = await hashOf(aContent);
+		const bHash = await hashOf(bContent);
+		const aOld = await hashOf("a-old");
+		const bOld = await hashOf("b-old");
+
+		s3State.files.set("a.md", new TextEncoder().encode(aContent));
+		s3State.files.set("b.md", new TextEncoder().encode(bContent));
+		s3State.manifest = manifest(2000, "peer", [
+			entry({ path: "a.md", sha256: aHash, version: 2, mtimeMs: 2000 }),
+			entry({ path: "b.md", sha256: bHash, version: 2, mtimeMs: 2000 }),
+		]);
+
+		const app = makeMockApp([
+			{ path: "a.md", content: "a-old", mtime: 1000 },
+			{ path: "b.md", content: "b-old", mtime: 1000 },
+		]);
+		const cachedManifest = manifest(1000, "me", [
+			entry({ path: "a.md", sha256: aOld, version: 1, mtimeMs: 1000 }),
+			entry({ path: "b.md", sha256: bOld, version: 1, mtimeMs: 1000 }),
+		]);
+
+		const saved: SyncManifest[] = [];
+		const saveCached = async (d: { manifest: SyncManifest }) => {
+			saved.push(JSON.parse(JSON.stringify(d.manifest)));
+		};
+
+		// Pass-through for "a.md", fail for "b.md".
+		vi.mocked(s3.downloadFile).mockImplementation(async (_c, _b, _p, path) => {
+			if (path === "b.md") throw new Error("network outage");
+			const d = s3State.files.get(path);
+			return d ? new Uint8Array(d) : null;
+		});
+
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+		await expect(
+			runSync(
+				app as any,
+				{} as any,
+				settings(),
+				{ manifest: cachedManifest },
+				saveCached,
+				undefined,
+				undefined,
+				plan.hashCache,
+				plan.remoteManifest
+			)
+		).rejects.toThrow("network outage");
+
+		// a.md was pulled and reconciled before the throw. b.md was not.
+		const aFile = app.vault.getAbstractFileByPath("a.md") as any;
+		expect(aFile._content).toBe(aContent);
+
+		expect(saved.length).toBeGreaterThan(0);
+		const lastSaved = saved[saved.length - 1];
+		expect(lastSaved.files["a.md"].sha256).toBe(aHash);
+		// b.md must still show its pre-sync state — we didn't pull it.
+		expect(lastSaved.files["b.md"].sha256).toBe(bOld);
+
+		// Restore the downloadFile mock for a clean retry.
+		vi.mocked(s3.downloadFile).mockImplementation(async (_c, _b, _p, path) => {
+			const d = s3State.files.get(path);
+			return d ? new Uint8Array(d) : null;
+		});
+
+		// Next plan: a.md is done, b.md is still a pending download-update.
+		const plan2 = await computeSyncPlan(app as any, {} as any, settings(), lastSaved);
+		expect(plan2.entries.find((e) => e.path === "a.md")).toBeUndefined();
+		expect(plan2.entries.find((e) => e.path === "b.md")?.action).toBe("download-update");
 	});
 });

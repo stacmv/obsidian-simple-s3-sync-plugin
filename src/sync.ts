@@ -111,121 +111,196 @@ export async function runSync(
 
 		const cachedManifest = cachedData?.manifest ?? createEmptyManifest(deviceName);
 
+		// Accumulates the new S3 state across steps 4/5. Initialized from remoteManifest
+		// so files we don't touch round-trip cleanly through step 6's putManifest.
+		const updatedManifest: SyncManifest = {
+			...remoteManifest,
+			files: { ...remoteManifest.files },
+		};
+
+		// Paths whose on-disk content matches updatedManifest.files[path] AND matches
+		// what's currently on S3. Safe to persist to the local cached manifest as a
+		// mid-sync checkpoint. Pushed-but-not-yet-manifested entries are deliberately
+		// excluded: if step 5/6 fails, the next sync needs to see local changes as
+		// pending uploads (the S3 manifest still references the old sha) and retry.
+		const reconciledPaths = new Set<string>();
+
+		// Cached snapshot safe to persist mid-sync: pre-sync cached base plus only
+		// the entries we've confirmed reconciled. Pushed entries are intentionally
+		// absent so a partial sync leaves them as pending local changes for retry.
+		const buildCheckpointSnapshot = (): SyncManifest => {
+			const snap: SyncManifest = {
+				...cachedManifest,
+				files: { ...cachedManifest.files },
+			};
+			for (const path of reconciledPaths) {
+				const entry = updatedManifest.files[path];
+				if (entry) snap.files[path] = entry;
+			}
+			return snap;
+		};
+
 		const pullEntries = Object.entries(remoteManifest.files).filter(
 			([path]) => shouldSyncFile(path, settings.includePatterns, settings.excludePatterns)
 		);
 		const pullTotal = pullEntries.length;
 		let pullIndex = 0;
 
-		for (const [path, remote] of pullEntries) {
-			checkAborted(signal);
-			pullIndex++;
-			onProgress?.(4, `Checking remote ${pullIndex} / ${pullTotal}`, result);
+		try {
+			for (const [path, remote] of pullEntries) {
+				checkAborted(signal);
+				pullIndex++;
+				onProgress?.(4, `Checking remote ${pullIndex} / ${pullTotal}`, result);
 
-			const cached = cachedManifest.files[path];
-			const localFile = app.vault.getAbstractFileByPath(normalizePath(path));
+				const cached = cachedManifest.files[path];
+				const localFile = app.vault.getAbstractFileByPath(normalizePath(path));
 
-			if (remote.deleted) {
-				// Remote deleted: trash local copy if it exists
-				if (localFile instanceof TFile) {
-					try {
-						await app.vault.trash(localFile, true);
-						result.pulled++;
-					} catch (e: any) {
-						result.errors.push(`Delete ${path}: ${e.message}`);
+				if (remote.deleted) {
+					// Remote deleted: trash local copy if it exists
+					if (localFile instanceof TFile) {
+						try {
+							await app.vault.trash(localFile, true);
+							result.pulled++;
+							reconciledPaths.add(path);
+						} catch (e: any) {
+							result.errors.push(`Delete ${path}: ${e.message}`);
+						}
+					} else {
+						// Already absent locally — confirm cached matches remote (deleted)
+						reconciledPaths.add(path);
 					}
-				}
-				continue;
-			}
-
-			if (!localFile) {
-				if (cached) {
-					// File was previously synced but is now missing locally: it was
-					// deleted locally. Skip download; Phase 2 will soft-delete on S3.
 					continue;
 				}
-				// New file from remote: download it
-				const data = await s3.downloadFile(client, bucket, prefix, path);
-				if (data) {
-					const dir = path.contains("/")
-						? path.substring(0, path.lastIndexOf("/"))
-						: "";
-					if (dir) {
-						await ensureDir(app, dir);
+
+				if (!localFile) {
+					if (cached) {
+						// File was previously synced but is now missing locally: it was
+						// deleted locally. Skip download; Phase 2 will soft-delete on S3.
+						continue;
 					}
-					await app.vault.createBinary(normalizePath(path), data.buffer as ArrayBuffer);
-					result.pulled++;
+					// New file from remote: download it
+					const data = await s3.downloadFile(client, bucket, prefix, path);
+					if (data) {
+						const dir = path.contains("/")
+							? path.substring(0, path.lastIndexOf("/"))
+							: "";
+						if (dir) {
+							await ensureDir(app, dir);
+						}
+						const created = await app.vault.createBinary(
+							normalizePath(path),
+							data.buffer as ArrayBuffer
+						);
+						if (created instanceof TFile) {
+							updatedManifest.files[path] = {
+								...updatedManifest.files[path],
+								mtimeMs: created.stat.mtime,
+								sizeBytes: created.stat.size,
+							};
+						}
+						hashCache?.set(path, remote.sha256);
+						reconciledPaths.add(path);
+						result.pulled++;
+					}
+					continue;
 				}
-				continue;
-			}
 
-			if (!(localFile instanceof TFile)) continue;
+				if (!(localFile instanceof TFile)) continue;
 
-			// File exists both locally and remotely
-			const remoteVersion = remote.version;
-			const cachedVersion = cached?.version ?? 0;
+				// File exists both locally and remotely
+				const remoteVersion = remote.version;
+				const cachedVersion = cached?.version ?? 0;
 
-			if (remoteVersion <= cachedVersion) continue; // no remote change
+				if (remoteVersion <= cachedVersion) continue; // no remote change
 
-			// Remote has a newer version: check for conflict
-			const { hash: localHash, data: localData } = await getHashAndData(app, localFile, hashCache);
-			const cachedHash = cached?.sha256 ?? "";
+				// Remote has a newer version: check for conflict
+				const { hash: localHash, data: localData } = await getHashAndData(app, localFile, hashCache);
+				const cachedHash = cached?.sha256 ?? "";
 
-			if (localHash === remote.sha256) {
-				// Same content, no action needed
-				continue;
-			}
-
-			const localChanged = localHash !== cachedHash;
-			const remoteChanged = remote.sha256 !== cachedHash;
-
-			if (localChanged && remoteChanged) {
-				// TRUE CONFLICT
-				const remoteData = await s3.downloadFile(client, bucket, prefix, path);
-				if (!remoteData) continue;
-
-				const resolved = await resolveConflict(
-					app,
-					client,
-					settings,
-					path,
-					localData,
-					remoteData,
-					remote.sha256,
-					cachedHash,
-					hashCache
-				);
-
-				if (resolved === "kept-both") {
-					// Local file was overwritten with remote content; treat it like a pull.
-					pulledPaths.add(path);
-					result.conflicts++;
-				} else if (resolved === "merged") {
-					result.conflicts++;
+				if (localHash === remote.sha256) {
+					// Already in sync — heal cached entry if it diverged (e.g. previous
+					// sync interrupted before saving cached, or peer republished same content).
+					updatedManifest.files[path] = {
+						...updatedManifest.files[path],
+						mtimeMs: localFile.stat.mtime,
+						sizeBytes: localFile.stat.size,
+					};
+					reconciledPaths.add(path);
+					continue;
 				}
-			} else if (remoteChanged && !localChanged) {
-				// Remote is newer, no local changes: just pull
-				const remoteData = await s3.downloadFile(client, bucket, prefix, path);
-				if (remoteData) {
-					await app.vault.modifyBinary(localFile, remoteData.buffer as ArrayBuffer);
-					// Local file is now the remote content; keep hashCache aligned so
-					// the push phase doesn't treat its own write as a local change
-					// (which would corrupt the manifest's recorded sha256).
-					hashCache?.set(path, remote.sha256);
-					pulledPaths.add(path);
-					result.pulled++;
+
+				const localChanged = localHash !== cachedHash;
+				const remoteChanged = remote.sha256 !== cachedHash;
+
+				if (localChanged && remoteChanged) {
+					// TRUE CONFLICT
+					const remoteData = await s3.downloadFile(client, bucket, prefix, path);
+					if (!remoteData) continue;
+
+					const resolved = await resolveConflict(
+						app,
+						client,
+						settings,
+						path,
+						localData,
+						remoteData,
+						remote.sha256,
+						cachedHash,
+						hashCache
+					);
+
+					if (resolved === "kept-both") {
+						// Local file was overwritten with remote content; treat it like a pull.
+						pulledPaths.add(path);
+						updatedManifest.files[path] = {
+							...updatedManifest.files[path],
+							mtimeMs: localFile.stat.mtime,
+							sizeBytes: localFile.stat.size,
+						};
+						reconciledPaths.add(path);
+						result.conflicts++;
+					} else if (resolved === "merged") {
+						// Merged content exists only locally until step 5/6 pushes it.
+						// Don't reconcile yet — a partial sync must replay the merge.
+						result.conflicts++;
+					}
+				} else if (remoteChanged && !localChanged) {
+					// Remote is newer, no local changes: just pull
+					const remoteData = await s3.downloadFile(client, bucket, prefix, path);
+					if (remoteData) {
+						await app.vault.modifyBinary(localFile, remoteData.buffer as ArrayBuffer);
+						// Local file is now the remote content; keep hashCache aligned so
+						// the push phase doesn't treat its own write as a local change
+						// (which would corrupt the manifest's recorded sha256).
+						hashCache?.set(path, remote.sha256);
+						pulledPaths.add(path);
+						updatedManifest.files[path] = {
+							...updatedManifest.files[path],
+							mtimeMs: localFile.stat.mtime,
+							sizeBytes: localFile.stat.size,
+						};
+						reconciledPaths.add(path);
+						result.pulled++;
+					}
 				}
+				// if localChanged && !remoteChanged: will be pushed in Phase 2
 			}
-			// if localChanged && !remoteChanged: will be pushed in Phase 2
+		} finally {
+			// Persist post-pull progress. Even if the pull loop threw partway, the
+			// paths already in reconciledPaths reflect the actual on-disk state, so
+			// the next sync won't re-pull them or mistake the partial pull for a
+			// concurrent edit (which would manifest as a phantom conflict).
+			// Swallow save errors so they don't mask the original exception.
+			try {
+				await saveCachedData({ manifest: buildCheckpointSnapshot() });
+			} catch (saveErr) {
+				console.error("S3 Sync: failed to persist post-pull checkpoint", saveErr);
+			}
 		}
 
 		// --- Step 5: Push ---
 		checkAborted(signal);
 		const allFiles = app.vault.getFiles();
-		const updatedManifest: SyncManifest = {
-			...remoteManifest,
-			files: { ...remoteManifest.files },
-		};
 
 		const pushFiles = allFiles.filter(
 			(f) => shouldSyncFile(f.path, settings.includePatterns, settings.excludePatterns)
