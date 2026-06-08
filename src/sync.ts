@@ -179,12 +179,17 @@ export async function runSync(
 				}
 
 				if (!localFile) {
-					if (cached) {
+					// A cached tombstone OLDER than this live remote means a peer
+					// resurrected the file after our deletion — the tombstone is
+					// superseded, so we must download it rather than skip.
+					const supersededTombstone =
+						cached?.deleted === true && remote.version > cached.version;
+					if (cached && !supersededTombstone) {
 						// File was previously synced but is now missing locally: it was
 						// deleted locally. Skip download; Phase 2 will soft-delete on S3.
 						continue;
 					}
-					// New file from remote: download it
+					// New file from remote (or a superseded-tombstone resurrection): download it
 					const data = await s3.downloadFile(client, bucket, prefix, path);
 					if (data) {
 						const dir = path.contains("/")
@@ -384,6 +389,14 @@ export async function runSync(
 
 			const localFile = app.vault.getAbstractFileByPath(normalizePath(path));
 			if (!localFile) {
+				// Defensive: if this live entry is NEWER than our cached tombstone, a
+				// peer resurrected it after our deletion. The pull phase should have
+				// downloaded it; if it somehow didn't (e.g. failed download), never
+				// re-tombstone it — that would destroy the peer's content.
+				const cachedTomb = cachedManifest.files[path];
+				if (cachedTomb?.deleted && entry.version > cachedTomb.version) {
+					continue;
+				}
 				const now = Date.now();
 				const alreadyCached = cachedManifest.files[path]?.deleted === true;
 				if (!alreadyCached) {

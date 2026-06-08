@@ -80,10 +80,27 @@ export async function computeSyncPlan(
 			continue;
 		}
 
-		// If our cached manifest already recorded this as deleted, the remote
-		// manifest is just stale (e.g. another device re-synced concurrently).
-		// The next sync will re-apply the deletion; don't show it again.
+		// Our cached manifest recorded this as deleted, but remote shows it live.
 		if (cached?.deleted) {
+			if (remote.version > cached.version) {
+				// Remote is NEWER than our tombstone — a peer resurrected the file
+				// after our deletion propagated. Adopt it rather than re-deleting.
+				if (!localFile) {
+					entries.push({ path, action: "download-new" });
+				} else if (localFile instanceof TFile) {
+					// Local re-creation races the peer resurrection: compare content.
+					const localData = new Uint8Array(await app.vault.readBinary(localFile));
+					const localHash = await sha256(localData.buffer as ArrayBuffer);
+					hashCache.set(path, localHash);
+					if (localHash !== remote.sha256) {
+						entries.push({ path, action: "conflict" });
+					}
+				}
+				planned.add(path);
+				continue;
+			}
+			// Remote is stale (our deletion hasn't propagated yet). The next sync
+			// will re-apply the deletion; don't surface it.
 			planned.add(path);
 			continue;
 		}

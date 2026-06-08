@@ -279,6 +279,135 @@ describe("runSync — hashCache must reflect post-pull file content (regression)
 	});
 });
 
+describe("runSync — superseded tombstone must not re-delete a peer resurrection (regression)", () => {
+	it("a stale-tombstone device adopts a remote resurrection instead of re-deleting it", async () => {
+		// Sequence: H deleted 24.md (cached tombstone v2, file gone locally). W
+		// re-created it and synced, so remote is now LIVE v3. H syncs again.
+		//
+		// Buggy behavior: H's pull skips the download (cached entry exists), then
+		// H's push delete-loop sees a live manifest entry with no local file and
+		// re-tombstones it to v4. W's next sync pulls v4 and trashes its content —
+		// the "constant deletion" the user keeps hitting.
+		//
+		// Correct behavior: remote.version (3) > H's tombstone version (2) means
+		// the deletion is superseded; H downloads the resurrection and leaves the
+		// manifest live.
+		const oldContent = "old pre-deletion content";
+		const resurrected = "W re-created this";
+		const oldHash = await hashOf(oldContent);
+		const resHash = await hashOf(resurrected);
+
+		// Remote: live v3 (W's resurrection).
+		s3State.files.set("24.md", new TextEncoder().encode(resurrected));
+		s3State.manifest = manifest(3000, "W", [
+			entry({
+				path: "24.md",
+				sha256: resHash,
+				version: 3,
+				mtimeMs: 3000,
+				deleted: false,
+				lastSyncedBy: "W",
+				lastSyncedAt: 3000,
+			}),
+		]);
+
+		// H: local file gone, cached records the tombstone at v2.
+		const hApp = makeMockApp([]);
+		const hCached = manifest(2000, "H", [
+			entry({
+				path: "24.md",
+				sha256: oldHash,
+				version: 2,
+				mtimeMs: 1000,
+				deleted: true,
+				deletedBy: "H",
+				deletedAt: 2000,
+				lastSyncedBy: "H",
+				lastSyncedAt: 2000,
+			}),
+		]);
+
+		const hPlan = await computeSyncPlan(hApp as any, {} as any, settings("H"), hCached);
+
+		// Plan-level: H should adopt the resurrection, not show "nothing to sync".
+		expect(hPlan.entries.find((e) => e.path === "24.md")?.action).toBe("download-new");
+
+		await runSync(
+			hApp as any,
+			{} as any,
+			settings("H"),
+			{ manifest: hCached },
+			async () => {},
+			undefined,
+			undefined,
+			hPlan.hashCache,
+			hPlan.remoteManifest
+		);
+
+		// H must have downloaded the resurrected file.
+		const hFile = hApp.vault.getAbstractFileByPath("24.md") as any;
+		expect(hFile?._content).toBe(resurrected);
+
+		// Crucially: the S3 manifest must STILL be live — H must not have
+		// re-tombstoned the peer's resurrection.
+		expect(s3State.manifest!.files["24.md"].deleted).toBe(false);
+		expect(s3State.manifest!.files["24.md"].sha256).toBe(resHash);
+		expect(s3State.files.has("24.md")).toBe(true);
+	});
+
+	it("a local re-creation that differs from a peer resurrection becomes a conflict (not 'nothing to sync')", async () => {
+		// The user's exact symptom: H deleted 24.md (cached tombstone v2), then
+		// re-created it locally with its own content. Meanwhile W resurrected it
+		// remotely (live v3) with different content. H syncs.
+		//
+		// Buggy behavior: plan reported "nothing to sync" and H kept its divergent
+		// copy forever. Correct: surface a conflict and keep BOTH copies.
+		const oldHash = await hashOf("old pre-deletion content");
+		const hLocal = "H re-created content";
+		const wRemote = "W resurrected content";
+		const wHash = await hashOf(wRemote);
+
+		s3State.files.set("24.md", new TextEncoder().encode(wRemote));
+		s3State.manifest = manifest(3000, "W", [
+			entry({ path: "24.md", sha256: wHash, version: 3, mtimeMs: 3000, deleted: false }),
+		]);
+
+		const hApp = makeMockApp([{ path: "24.md", content: hLocal, mtime: 4000 }]);
+		const hCached = manifest(2000, "H", [
+			entry({
+				path: "24.md",
+				sha256: oldHash,
+				version: 2,
+				mtimeMs: 1000,
+				deleted: true,
+				deletedAt: 2000,
+			}),
+		]);
+
+		const hPlan = await computeSyncPlan(hApp as any, {} as any, settings("H"), hCached);
+		expect(hPlan.entries.find((e) => e.path === "24.md")?.action).toBe("conflict");
+
+		await runSync(
+			hApp as any,
+			{} as any,
+			settings("H"),
+			{ manifest: hCached },
+			async () => {},
+			undefined,
+			undefined,
+			hPlan.hashCache,
+			hPlan.remoteManifest
+		);
+
+		// Both copies survive: 24.md now holds W's content, H's content is in a
+		// conflict-* copy. Nothing was silently dropped, manifest stays live.
+		const files = hApp.vault.getFiles().map((f) => (f as any)._content);
+		expect(files).toContain(wRemote);
+		expect(files).toContain(hLocal);
+		expect(s3State.manifest!.files["24.md"].deleted).toBe(false);
+	});
+});
+
 describe("runSync — partial failures must not poison cached state (regression)", () => {
 	it("interrupted putManifest leaves pulled files reconciled in cached", async () => {
 		// Scenario: device pulls a remote update, but step 6 putManifest fails.
