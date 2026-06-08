@@ -139,6 +139,101 @@ describe("computeSyncPlan — empty cached manifest (cache wipe)", () => {
 		expect(entry!.action).toBe("download-update");
 	});
 
+	it("should upload-new (not delete-local) when both cached and remote show deleted but local exists", async () => {
+		// User deleted the file on device B (tombstone in remote), device A applied
+		// the deletion (cached also shows deleted), then re-created the file locally.
+		// This must be treated as a resurrection, not yet-another deletion.
+		const tombstoneHash = await hashOf("old content before deletion");
+
+		mockedGetManifest.mockResolvedValue({
+			schemaVersion: 1,
+			lastUpdated: 3000,
+			lastUpdatedBy: "pc",
+			files: {
+				"24.md": makeEntry({
+					path: "24.md",
+					sha256: tombstoneHash,
+					version: 2,
+					deleted: true,
+					deletedBy: "pc",
+					deletedAt: 2500,
+				}),
+			},
+		});
+
+		const cachedManifest: SyncManifest = {
+			schemaVersion: 1,
+			lastUpdated: 3000,
+			lastUpdatedBy: "phone",
+			files: {
+				"24.md": makeEntry({
+					path: "24.md",
+					sha256: tombstoneHash,
+					version: 2,
+					deleted: true,
+					deletedBy: "pc",
+					deletedAt: 2500,
+				}),
+			},
+		};
+
+		const plan = await computeSyncPlan(
+			makeMockApp([{ path: "24.md", mtime: 5000, content: "freshly re-created" }]),
+			{} as any,
+			makeSettings(),
+			cachedManifest,
+		);
+
+		const entry = plan.entries.find((e) => e.path === "24.md");
+		expect(entry).toBeDefined();
+		expect(entry!.action).toBe("upload-new");
+	});
+
+	it("should still delete-local when remote shows deleted but cached does not (tombstone not yet applied)", async () => {
+		// Different scenario: another device deleted the file, we have it locally
+		// but haven't applied the deletion yet. Must apply the tombstone.
+		const remoteHash = await hashOf("old content");
+
+		mockedGetManifest.mockResolvedValue({
+			schemaVersion: 1,
+			lastUpdated: 3000,
+			lastUpdatedBy: "pc",
+			files: {
+				"notes/old.md": makeEntry({
+					path: "notes/old.md",
+					sha256: remoteHash,
+					version: 2,
+					deleted: true,
+				}),
+			},
+		});
+
+		const cachedManifest: SyncManifest = {
+			schemaVersion: 1,
+			lastUpdated: 1000,
+			lastUpdatedBy: "phone",
+			files: {
+				"notes/old.md": makeEntry({
+					path: "notes/old.md",
+					sha256: remoteHash,
+					version: 1,
+					deleted: false,
+				}),
+			},
+		};
+
+		const plan = await computeSyncPlan(
+			makeMockApp([{ path: "notes/old.md", mtime: 1000, content: "old content" }]),
+			{} as any,
+			makeSettings(),
+			cachedManifest,
+		);
+
+		const entry = plan.entries.find((e) => e.path === "notes/old.md");
+		expect(entry).toBeDefined();
+		expect(entry!.action).toBe("delete-local");
+	});
+
 	it("should detect real conflict when cached manifest has history", async () => {
 		const baseHash = await hashOf("base version");
 		const remoteHash = await hashOf("remotely modified");

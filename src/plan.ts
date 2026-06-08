@@ -69,7 +69,12 @@ export async function computeSyncPlan(
 
 		if (remote.deleted) {
 			if (localFile instanceof TFile) {
-				entries.push({ path, action: "delete-local" });
+				// If cached also shows deleted, this device already applied the
+				// tombstone in a prior sync — the local file must be a fresh
+				// re-creation (user typed the same name again, or restored from
+				// trash). Resurrect by uploading instead of re-deleting.
+				const action = cached?.deleted ? "upload-new" : "delete-local";
+				entries.push({ path, action });
 				planned.add(path);
 			}
 			continue;

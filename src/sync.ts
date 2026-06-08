@@ -158,12 +158,18 @@ export async function runSync(
 				if (remote.deleted) {
 					// Remote deleted: trash local copy if it exists
 					if (localFile instanceof TFile) {
-						try {
-							await app.vault.trash(localFile, true);
-							result.pulled++;
-							reconciledPaths.add(path);
-						} catch (e: any) {
-							result.errors.push(`Delete ${path}: ${e.message}`);
+						if (cached?.deleted) {
+							// We already acknowledged this deletion in a prior sync —
+							// the file's presence now means it was re-created locally.
+							// Leave it alone; the push phase will resurrect it on S3.
+						} else {
+							try {
+								await app.vault.trash(localFile, true);
+								result.pulled++;
+								reconciledPaths.add(path);
+							} catch (e: any) {
+								result.errors.push(`Delete ${path}: ${e.message}`);
+							}
 						}
 					} else {
 						// Already absent locally — confirm cached matches remote (deleted)
@@ -316,8 +322,9 @@ export async function runSync(
 			const path = file.path;
 			const existing = updatedManifest.files[path];
 
-			if (!existing) {
-				// New file: read once — use cached hash if available, otherwise hash while reading
+			if (!existing || existing.deleted) {
+				// New file or resurrection of a previously-deleted entry.
+				// Bump version above the tombstone so peers pick up the resurrection.
 				const localData = new Uint8Array(await app.vault.readBinary(file));
 				const localHash =
 					hashCache?.get(path) ??
@@ -333,12 +340,12 @@ export async function runSync(
 					sizeBytes: file.stat.size,
 					lastSyncedBy: deviceName,
 					lastSyncedAt: Date.now(),
-					version: 1,
+					version: (existing?.version ?? 0) + 1,
 					deleted: false,
 				};
 				result.pushed++;
-			} else if (!existing.deleted) {
-				// Existing file: hash-only check first (cache hit = zero disk I/O for unchanged files)
+			} else {
+				// Existing non-deleted entry: hash-only check first (cache hit = zero disk I/O for unchanged files)
 				const localHash = await getHashOnly(app, file, hashCache);
 				if (localHash !== existing.sha256) {
 					onProgress?.(5, `Uploading ${path}`, result);
