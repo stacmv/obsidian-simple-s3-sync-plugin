@@ -189,6 +189,49 @@ describe("computeSyncPlan — empty cached manifest (cache wipe)", () => {
 		expect(entry!.action).toBe("upload-new");
 	});
 
+	it("should upload-new when remote shows deleted, local exists, and cached has no entry at all", async () => {
+		// User's actual reported case: the file was created+deleted on device B
+		// before this device ever knew about it. On this device cached has no
+		// entry, but the user created a file with the same name locally and
+		// wants to keep it. Must resurrect, not delete-local.
+		const tombstoneHash = await hashOf("content from device B before deletion");
+
+		mockedGetManifest.mockResolvedValue({
+			schemaVersion: 1,
+			lastUpdated: 3000,
+			lastUpdatedBy: "work",
+			files: {
+				"24.md": makeEntry({
+					path: "24.md",
+					sha256: tombstoneHash,
+					version: 2,
+					deleted: true,
+					deletedBy: "work",
+					deletedAt: 2500,
+				}),
+			},
+		});
+
+		// Cached manifest has NO entry for 24.md — device never saw it before.
+		const cachedManifest: SyncManifest = {
+			schemaVersion: 1,
+			lastUpdated: 1000,
+			lastUpdatedBy: "home",
+			files: {},
+		};
+
+		const plan = await computeSyncPlan(
+			makeMockApp([{ path: "24.md", mtime: 5000, content: "freshly created on home" }]),
+			{} as any,
+			makeSettings(),
+			cachedManifest,
+		);
+
+		const entry = plan.entries.find((e) => e.path === "24.md");
+		expect(entry).toBeDefined();
+		expect(entry!.action).toBe("upload-new");
+	});
+
 	it("should still delete-local when remote shows deleted but cached does not (tombstone not yet applied)", async () => {
 		// Different scenario: another device deleted the file, we have it locally
 		// but haven't applied the deletion yet. Must apply the tombstone.

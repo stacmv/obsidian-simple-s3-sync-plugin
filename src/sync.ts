@@ -158,10 +158,12 @@ export async function runSync(
 				if (remote.deleted) {
 					// Remote deleted: trash local copy if it exists
 					if (localFile instanceof TFile) {
-						if (cached?.deleted) {
-							// We already acknowledged this deletion in a prior sync —
-							// the file's presence now means it was re-created locally.
-							// Leave it alone; the push phase will resurrect it on S3.
+						if (!cached || cached.deleted) {
+							// Either we already acknowledged this deletion in a prior
+							// sync (cached.deleted), or this device never had a record
+							// of the path at all (cached missing). In both cases the
+							// local file is a fresh creation here — leave it alone
+							// and let the push phase resurrect it on S3.
 						} else {
 							try {
 								await app.vault.trash(localFile, true);
