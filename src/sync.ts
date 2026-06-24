@@ -37,6 +37,157 @@ function checkAborted(signal?: AbortSignal) {
 	if (signal?.aborted) throw new SyncCancelledError();
 }
 
+// Returns true if all entries under folderPath/ have deleted: true
+function isAllFilesDeleted(
+	folderPath: string,
+	manifest: SyncManifest,
+	settings: S3SyncSettings
+): boolean {
+	const normalizedFolderPath = normalizePath(folderPath);
+	const folderPrefix = normalizedFolderPath.endsWith("/")
+		? normalizedFolderPath
+		: `${normalizedFolderPath}/`;
+
+	for (const [path, entry] of Object.entries(manifest.files)) {
+		if (path.startsWith(folderPrefix)) {
+			if (shouldSyncFile(path, settings.includePatterns, settings.excludePatterns)) {
+				if (!entry.deleted) {
+					return false;
+				}
+			}
+		}
+	}
+
+	// Return true if all entries are deleted, or if folder has no synced entries
+	return true;
+}
+
+// Lists folders with zero synced files under the given folderPath
+function getEmptyFolders(
+	app: App,
+	folderPath: string,
+	manifest: SyncManifest,
+	settings: S3SyncSettings
+): string[] {
+	const emptyFolders: string[] = [];
+	const normalizedFolderPath = normalizePath(folderPath);
+	const allFiles = app.vault.getFiles();
+	const foldersToCheck = new Set<string>();
+
+	// Collect all folders from manifest entries (includes deleted files)
+	// This ensures we check folders even if all their files are deleted
+	for (const [path] of Object.entries(manifest.files)) {
+		if (shouldSyncFile(path, settings.includePatterns, settings.excludePatterns)) {
+			const filePath = normalizePath(path);
+			if (filePath.startsWith(`${normalizedFolderPath}/`)) {
+				// Extract all parent directories of this file, including folderPath itself
+				const parts = filePath.split("/");
+				let currentPath = "";
+				for (const part of parts.slice(0, -1)) {
+					currentPath = currentPath ? `${currentPath}/${part}` : part;
+					if (currentPath.startsWith(normalizedFolderPath)) {
+						foldersToCheck.add(currentPath);
+					}
+				}
+			}
+		}
+	}
+
+	// Check each folder to see if it has any synced files (alive, not deleted)
+	for (const folderPath of foldersToCheck) {
+		let hasSyncedFiles = false;
+		for (const file of allFiles) {
+			const filePath = normalizePath(file.path);
+			if (filePath.startsWith(`${folderPath}/`)) {
+				if (shouldSyncFile(filePath, settings.includePatterns, settings.excludePatterns)) {
+					hasSyncedFiles = true;
+					break;
+				}
+			}
+		}
+		if (!hasSyncedFiles) {
+			emptyFolders.push(folderPath);
+		}
+	}
+
+	return emptyFolders;
+}
+
+// Returns true if a folder should be deleted (all synced files deleted, no active subfolders)
+function shouldCleanupFolder(
+	path: string,
+	manifest: SyncManifest,
+	app: App,
+	settings: S3SyncSettings
+): boolean {
+	const normalizedPath = normalizePath(path);
+
+	// Check if all synced files under this folder are deleted
+	if (!isAllFilesDeleted(normalizedPath, manifest, settings)) {
+		return false;
+	}
+
+	// Check if the folder path itself matches includePatterns filter
+	if (!shouldSyncFile(normalizedPath, settings.includePatterns, settings.excludePatterns)) {
+		return false;
+	}
+
+	// Check if the folder is in the empty folders list (has no synced files)
+	const emptyFolders = getEmptyFolders(app, normalizedPath, manifest, settings);
+	return emptyFolders.includes(normalizedPath);
+}
+
+// Main cleanup function: recursively delete empty folders after file deletions
+async function cleanupEmptyFolders(
+	app: App,
+	manifest: SyncManifest,
+	settings: S3SyncSettings,
+	onProgress?: SyncProgressCallback,
+	result?: SyncResult
+): Promise<void> {
+	// Collect all parent folders of deleted files
+	const deletedFileFolders = new Set<string>();
+	for (const [path, entry] of Object.entries(manifest.files)) {
+		if (entry.deleted && shouldSyncFile(path, settings.includePatterns, settings.excludePatterns)) {
+			// Extract parent folders
+			const parts = path.split("/");
+			let currentPath = "";
+			for (let i = 0; i < parts.length - 1; i++) {
+				currentPath = currentPath ? `${currentPath}/${parts[i]}` : parts[i];
+				deletedFileFolders.add(currentPath);
+			}
+		}
+	}
+
+	// For each deleted file's parent path, try to cleanup recursively up the tree
+	for (const folderPath of deletedFileFolders) {
+		let currentPath: string | undefined = folderPath;
+		while (currentPath) {
+			if (shouldCleanupFolder(currentPath, manifest, app, settings)) {
+				try {
+					const folder = app.vault.getAbstractFileByPath(normalizePath(currentPath));
+					if (folder && !folder.isRoot) {
+						await app.vault.delete(folder);
+						onProgress?.(6, `Cleaned up folder: ${currentPath}`, result);
+						// Move up to parent folder
+						const lastSlash = currentPath.lastIndexOf("/");
+						currentPath = lastSlash > 0 ? currentPath.substring(0, lastSlash) : undefined;
+					} else {
+						currentPath = undefined;
+					}
+				} catch (e: any) {
+					// Log error but don't throw; folder might already be gone or permission issue
+					result?.errors.push(`Cleanup folder ${currentPath}: ${e.message}`);
+					currentPath = undefined;
+				}
+			} else {
+				// Folder has active files, stop going up
+				currentPath = undefined;
+			}
+		}
+	}
+}
+
 // Returns hash only — uses cache, reads file only on miss. No unnecessary disk I/O.
 async function getHashOnly(
 	app: App,
@@ -88,9 +239,12 @@ export async function runSync(
 
 	const existingLock = await s3.getLock(client, bucket, prefix);
 	if (existingLock && !isLockStale(existingLock)) {
-		throw new Error(
-			`Sync locked by "${existingLock.deviceName}". Try again in a few minutes.`
-		);
+		// Allow override if same device (stale lock from crashed sync on this device)
+		if (existingLock.deviceName !== deviceName) {
+			throw new Error(
+				`Sync locked by "${existingLock.deviceName}". Try again in a few minutes.`
+			);
+		}
 	}
 	await s3.putLock(client, bucket, prefix, {
 		deviceName,
@@ -448,10 +602,21 @@ export async function runSync(
 			}
 		}
 
+		// Clean up empty folders after manifest is finalized
+		checkAborted(signal);
+		onProgress?.(6, "Cleaning up empty folders...", result);
+		await cleanupEmptyFolders(app, updatedManifest, settings, onProgress, result);
+
 		updatedManifest.lastUpdated = Date.now();
 		updatedManifest.lastUpdatedBy = deviceName;
 
-		await s3.putManifest(client, bucket, prefix, updatedManifest);
+		// Only write manifest if it changed (avoid slow S3 upload on no-op syncs)
+		const manifestChanged =
+			JSON.stringify(updatedManifest) !== JSON.stringify(remoteManifest);
+		if (manifestChanged) {
+			onProgress?.(6, "Writing manifest...", result);
+			await s3.putManifest(client, bucket, prefix, updatedManifest);
+		}
 		await saveCachedData({ manifest: updatedManifest });
 	} finally {
 		await s3.deleteLock(client, bucket, prefix).catch(() => {});

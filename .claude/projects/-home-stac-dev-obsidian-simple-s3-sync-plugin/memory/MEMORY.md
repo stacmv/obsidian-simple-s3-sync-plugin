@@ -1,0 +1,1 @@
+- [Tombstone/resurrection deadlock](tombstone-resurrection-deadlock.md) — root cause of the recurring "file keeps deleting / nothing to sync" bug; sync.ts ignores the plan
