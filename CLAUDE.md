@@ -4,8 +4,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-All commands go through the Makefile — **always use `make` targets**, not npm scripts directly.
-
 | Command | Purpose |
 |---------|---------|
 | `make build` | Production build → `main.js` |

@@ -16,6 +16,12 @@ export interface S3SyncSettings {
 	excludePatterns: string[];
 
 	mergeStrategy: "keep-both" | "3way-merge";
+
+	// Drop deleted-file tombstones older than this many days during finalize.
+	// Tombstones are required to detect peer resurrection across devices; GC
+	// keeps the manifest from growing forever for users who actively delete
+	// files. 0 disables GC (tombstones kept forever).
+	tombstoneRetentionDays: number;
 }
 
 export const DEFAULT_SETTINGS: S3SyncSettings = {
@@ -33,6 +39,8 @@ export const DEFAULT_SETTINGS: S3SyncSettings = {
 	excludePatterns: [".obsidian/**", ".trash/**"],
 
 	mergeStrategy: Platform.isMobile ? "keep-both" : "3way-merge",
+
+	tombstoneRetentionDays: 5,
 };
 
 export class S3SyncSettingTab extends PluginSettingTab {
@@ -205,6 +213,26 @@ export class S3SyncSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.mergeStrategy = value as S3SyncSettings["mergeStrategy"];
 						await this.plugin.saveSettings();
+					})
+			);
+
+		// --- Maintenance ---
+		new Setting(containerEl)
+			.setName("Tombstone retention (days)")
+			.setDesc(
+				"Drop deleted-file tombstones from the manifest after this many days. " +
+					"Tombstones are required to detect peer resurrection, so this should be " +
+					"longer than your longest offline period. 0 = keep tombstones forever."
+			)
+			.addText((text) =>
+				text
+					.setValue(String(this.plugin.settings.tombstoneRetentionDays))
+					.onChange(async (value) => {
+						const n = parseInt(value, 10);
+						if (!isNaN(n) && n >= 0) {
+							this.plugin.settings.tombstoneRetentionDays = n;
+							await this.plugin.saveSettings();
+						}
 					})
 			);
 	}

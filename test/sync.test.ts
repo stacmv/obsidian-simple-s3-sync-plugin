@@ -73,6 +73,7 @@ function settings(deviceName = "me"): S3SyncSettings {
 		includePatterns: [],
 		excludePatterns: [],
 		mergeStrategy: "keep-both",
+		tombstoneRetentionDays: 5,
 	};
 }
 
@@ -609,5 +610,306 @@ describe("runSync — partial failures must not poison cached state (regression)
 		const plan2 = await computeSyncPlan(app as any, {} as any, settings(), lastSaved);
 		expect(plan2.entries.find((e) => e.path === "a.md")).toBeUndefined();
 		expect(plan2.entries.find((e) => e.path === "b.md")?.action).toBe("download-update");
+	});
+});
+
+import { gcOldTombstones } from "../src/sync";
+
+describe("gcOldTombstones — unit", () => {
+	const DAY = 24 * 60 * 60 * 1000;
+	const NOW = Date.now();
+
+	function build(entries: Partial<ManifestEntry>[]): SyncManifest {
+		const files: Record<string, ManifestEntry> = {};
+		for (const e of entries) {
+			files[e.path!] = {
+				sha256: "h",
+				mtimeMs: 1,
+				sizeBytes: 1,
+				lastSyncedBy: "x",
+				lastSyncedAt: 1,
+				version: 1,
+				deleted: false,
+				...e,
+			} as ManifestEntry;
+		}
+		return { schemaVersion: 1, lastUpdated: NOW, lastUpdatedBy: "x", files };
+	}
+
+	it("drops tombstones older than retention", () => {
+		const m = build([
+			{ path: "old.md", deleted: true, deletedAt: NOW - 6 * DAY },
+			{ path: "fresh.md", deleted: true, deletedAt: NOW - 3 * DAY },
+			{ path: "alive.md", deleted: false, mtimeMs: 1 },
+		]);
+		const { manifest: out, dropped } = gcOldTombstones(m, 5 * DAY, NOW);
+		expect(dropped).toBe(1);
+		expect(out.files["old.md"]).toBeUndefined();
+		expect(out.files["fresh.md"]).toBeDefined();
+		expect(out.files["alive.md"]).toBeDefined();
+	});
+
+	it("retentionMs = 0 disables GC entirely", () => {
+		const m = build([{ path: "ancient.md", deleted: true, deletedAt: NOW - 365 * DAY }]);
+		const { dropped } = gcOldTombstones(m, 0, NOW);
+		expect(dropped).toBe(0);
+		expect(m.files["ancient.md"]).toBeDefined();
+	});
+
+	it("tombstones without deletedAt are skipped (legacy safety)", () => {
+		// Schema v1 always populated deletedAt on tombstone creation, but older
+		// entries from migrations could lack it. Don't silently drop them.
+		const m = build([{ path: "legacy.md", deleted: true }]);
+		const { dropped, manifest: out } = gcOldTombstones(m, 5 * DAY, NOW);
+		expect(dropped).toBe(0);
+		expect(out.files["legacy.md"]).toBeDefined();
+	});
+
+	it("boundary: exactly at retention is kept (strict greater-than)", () => {
+		const m = build([{ path: "edge.md", deleted: true, deletedAt: NOW - 5 * DAY }]);
+		const { dropped, manifest: out } = gcOldTombstones(m, 5 * DAY, NOW);
+		expect(dropped).toBe(0);
+		expect(out.files["edge.md"]).toBeDefined();
+	});
+
+	it("does not mutate input manifest", () => {
+		const m = build([{ path: "old.md", deleted: true, deletedAt: NOW - 10 * DAY }]);
+		const before = JSON.stringify(m);
+		gcOldTombstones(m, 5 * DAY, NOW);
+		expect(JSON.stringify(m)).toBe(before);
+	});
+
+	it("returns the original reference when nothing is dropped (no GC churn)", () => {
+		const m = build([{ path: "fresh.md", deleted: true, deletedAt: NOW - 1 * DAY }]);
+		const { manifest: out, dropped } = gcOldTombstones(m, 5 * DAY, NOW);
+		expect(dropped).toBe(0);
+		expect(out).toBe(m); // identity preserved when no work to do
+	});
+});
+
+describe("runSync — tombstone GC drops stale deletions from the manifest (regression)", () => {
+	const DAY = 24 * 60 * 60 * 1000;
+
+	it("a tombstone past retention is removed from the S3 manifest", async () => {
+		const oldContent = "deleted content";
+		const oldHash = await hashOf(oldContent);
+
+		// Remote: stale tombstone, deletedAt is 10 days ago.
+		const deletedAt = Date.now() - 10 * DAY;
+		s3State.manifest = manifest(deletedAt, "old-device", [
+			entry({
+				path: "old.md",
+				sha256: oldHash,
+				version: 5,
+				mtimeMs: 1,
+				deleted: true,
+				deletedBy: "old-device",
+				deletedAt,
+				lastSyncedAt: deletedAt,
+			}),
+		]);
+
+		// Local: nothing for old.md. Cached: same tombstone.
+		const app = makeMockApp([]);
+		const cachedManifest = manifest(deletedAt, "me", [
+			entry({
+				path: "old.md",
+				sha256: oldHash,
+				version: 5,
+				deleted: true,
+				deletedAt,
+			}),
+		]);
+
+		const s = settings();
+		s.tombstoneRetentionDays = 5;
+
+		await runSync(
+			app as any,
+			{} as any,
+			s,
+			{ manifest: cachedManifest },
+			async () => {},
+			undefined,
+			undefined,
+			new Map(),
+			JSON.parse(JSON.stringify(cachedManifest))
+		);
+
+		// S3 manifest must no longer carry the tombstone.
+		expect(s3State.manifest!.files["old.md"]).toBeUndefined();
+	});
+
+	it("a recent tombstone (within retention) is preserved", async () => {
+		const hash = await hashOf("freshly deleted");
+		const deletedAt = Date.now() - 1 * DAY; // 1 day ago, retention is 5
+		s3State.manifest = manifest(deletedAt, "me", [
+			entry({
+				path: "recent.md",
+				sha256: hash,
+				version: 3,
+				deleted: true,
+				deletedBy: "me",
+				deletedAt,
+				lastSyncedAt: deletedAt,
+			}),
+		]);
+
+		const app = makeMockApp([]);
+		const cachedManifest = manifest(deletedAt, "me", [
+			entry({
+				path: "recent.md",
+				sha256: hash,
+				version: 3,
+				deleted: true,
+				deletedAt,
+			}),
+		]);
+
+		const s = settings();
+		s.tombstoneRetentionDays = 5;
+
+		await runSync(
+			app as any,
+			{} as any,
+			s,
+			{ manifest: cachedManifest },
+			async () => {},
+			undefined,
+			undefined,
+			new Map(),
+			JSON.parse(JSON.stringify(cachedManifest))
+		);
+
+		expect(s3State.manifest!.files["recent.md"]).toBeDefined();
+		expect(s3State.manifest!.files["recent.md"].deleted).toBe(true);
+	});
+
+	it("retentionDays = 0 keeps tombstones forever", async () => {
+		const hash = await hashOf("ancient");
+		const deletedAt = Date.now() - 365 * DAY;
+		s3State.manifest = manifest(deletedAt, "me", [
+			entry({
+				path: "ancient.md",
+				sha256: hash,
+				version: 7,
+				deleted: true,
+				deletedBy: "me",
+				deletedAt,
+				lastSyncedAt: deletedAt,
+			}),
+		]);
+
+		const app = makeMockApp([]);
+		const cachedManifest = manifest(deletedAt, "me", [
+			entry({
+				path: "ancient.md",
+				sha256: hash,
+				version: 7,
+				deleted: true,
+				deletedAt,
+			}),
+		]);
+
+		const s = settings();
+		s.tombstoneRetentionDays = 0;
+
+		await runSync(
+			app as any,
+			{} as any,
+			s,
+			{ manifest: cachedManifest },
+			async () => {},
+			undefined,
+			undefined,
+			new Map(),
+			JSON.parse(JSON.stringify(cachedManifest))
+		);
+
+		expect(s3State.manifest!.files["ancient.md"]).toBeDefined();
+	});
+
+	it("peer resurrection arriving via re-check wins over GC", async () => {
+		// Scenario: stale tombstone on S3 (older than retention). A peer
+		// resurrects the file concurrently and uploads a new version before
+		// our finalize re-check runs. GC must NOT drop the live entry — the
+		// re-check merge is what installs the live entry first, then GC sees
+		// a non-deleted entry and leaves it alone.
+		const oldHash = await hashOf("pre-deletion");
+		const resContent = "peer resurrected this";
+		const resHash = await hashOf(resContent);
+
+		const deletedAt = Date.now() - 10 * DAY; // tombstone is way past retention
+		s3State.files.set("24.md", new TextEncoder().encode(resContent));
+
+		// Initial remoteManifest (what runSync sees at step 4): the tombstone.
+		const initialRemote = manifest(deletedAt, "peer", [
+			entry({
+				path: "24.md",
+				sha256: oldHash,
+				version: 5,
+				deleted: true,
+				deletedBy: "peer",
+				deletedAt,
+				lastSyncedAt: deletedAt,
+			}),
+		]);
+		s3State.manifest = initialRemote;
+
+		// Re-check manifest (what runSync fetches at finalize): the peer just
+		// uploaded a live version v6. lastUpdated differs so the merge runs.
+		const recheckManifest = manifest(Date.now(), "peer", [
+			entry({
+				path: "24.md",
+				sha256: resHash,
+				version: 6,
+				mtimeMs: Date.now(),
+				deleted: false,
+				lastSyncedBy: "peer",
+				lastSyncedAt: Date.now(),
+			}),
+		]);
+
+		// Mock getManifest to return initial on first call (pull phase) and
+		// the resurrected version on second call (finalize re-check).
+		let call = 0;
+		vi.mocked(s3.getManifest).mockImplementation(async () => {
+			call++;
+			return call === 1
+				? JSON.parse(JSON.stringify(initialRemote))
+				: JSON.parse(JSON.stringify(recheckManifest));
+		});
+
+		const app = makeMockApp([]);
+		const cachedManifest = manifest(deletedAt, "me", [
+			entry({
+				path: "24.md",
+				sha256: oldHash,
+				version: 5,
+				deleted: true,
+				deletedAt,
+			}),
+		]);
+
+		const s = settings();
+		s.tombstoneRetentionDays = 5;
+
+		await runSync(
+			app as any,
+			{} as any,
+			s,
+			{ manifest: cachedManifest },
+			async () => {},
+			undefined,
+			undefined,
+			new Map(),
+			undefined // force re-fetch on pull so our mock gets called
+		);
+
+		// The live resurrection must survive — re-check merge installs v6,
+		// GC then sees a non-deleted entry and skips it.
+		expect(s3State.manifest!.files["24.md"]).toBeDefined();
+		expect(s3State.manifest!.files["24.md"].deleted).toBe(false);
+		expect(s3State.manifest!.files["24.md"].sha256).toBe(resHash);
 	});
 });

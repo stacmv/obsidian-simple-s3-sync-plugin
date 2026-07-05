@@ -37,6 +37,38 @@ function checkAborted(signal?: AbortSignal) {
 	if (signal?.aborted) throw new SyncCancelledError();
 }
 
+// Drop tombstones (deleted entries) older than retentionMs. Returns a fresh
+// manifest with the old entries removed and the count dropped.
+//
+// Tombstones are load-bearing for peer-resurrection detection — they stay until
+// a peer's live upload supersedes them via version comparison, OR until enough
+// time passes that no reasonable peer could still resurrect. The cutoff lives
+// on the deleted timestamp so the cutoff is deterministic from data already in
+// the manifest (no extra clock state to track per-entry).
+//
+// retentionMs <= 0 disables GC. Entries without a deletedAt are skipped so
+// legacy data from older schema versions isn't accidentally wiped.
+export function gcOldTombstones(
+	manifest: SyncManifest,
+	retentionMs: number,
+	now: number = Date.now()
+): { manifest: SyncManifest; dropped: number } {
+	if (retentionMs <= 0) return { manifest, dropped: 0 };
+	const files = { ...manifest.files };
+	let dropped = 0;
+	for (const [path, entry] of Object.entries(files)) {
+		if (!entry.deleted) continue;
+		const deletedAt = entry.deletedAt;
+		if (deletedAt === undefined) continue;
+		if (now - deletedAt > retentionMs) {
+			delete files[path];
+			dropped++;
+		}
+	}
+	if (dropped === 0) return { manifest, dropped: 0 };
+	return { manifest: { ...manifest, files }, dropped };
+}
+
 // Returns true if all entries under folderPath/ have deleted: true
 function isAllFilesDeleted(
 	folderPath: string,
@@ -600,6 +632,25 @@ export async function runSync(
 					updatedManifest.files[path] = entry;
 				}
 			}
+		}
+
+		// GC tombstones older than the configured retention. Done AFTER the
+		// re-check merge so a peer's live resurrection always supersedes a
+		// tombstone (the resurrection arrives as a non-deleted entry first;
+		// GC then sees it as alive and leaves it alone).
+		const retentionMs =
+			settings.tombstoneRetentionDays * 24 * 60 * 60 * 1000;
+		const { manifest: gcManifest, dropped: droppedTombstones } = gcOldTombstones(
+			updatedManifest,
+			retentionMs
+		);
+		if (droppedTombstones > 0) {
+			onProgress?.(
+				6,
+				`Garbage-collected ${droppedTombstones} old tombstone${droppedTombstones === 1 ? "" : "s"}`,
+				result
+			);
+			updatedManifest.files = gcManifest.files;
 		}
 
 		// Clean up empty folders after manifest is finalized
