@@ -913,3 +913,99 @@ describe("runSync — tombstone GC drops stale deletions from the manifest (regr
 		expect(s3State.manifest!.files["24.md"].sha256).toBe(resHash);
 	});
 });
+
+import { releaseLock } from "../src/sync";
+
+describe("releaseLock — a leaked lock must never be swallowed", () => {
+	const noWait = async () => {};
+
+	it("returns true and clears the lock on success", async () => {
+		s3State.lock = { deviceName: "me", timestamp: 1000 };
+		const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
+
+		const ok = await releaseLock({} as any, "b", "p", result, noWait);
+
+		expect(ok).toBe(true);
+		expect(s3State.lock).toBeNull();
+		expect(result.errors).toHaveLength(0);
+	});
+
+	it("retries a transient failure and succeeds", async () => {
+		s3State.lock = { deviceName: "me", timestamp: 1000 };
+		const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
+
+		// Call history accumulates across the file (no clearMocks); reset it so
+		// the count assertion below only measures this test's attempts.
+		vi.mocked(s3.deleteLock).mockClear();
+		vi.mocked(s3.deleteLock)
+			.mockRejectedValueOnce(new Error("network blip"))
+			.mockImplementationOnce(async () => {
+				s3State.lock = null;
+			});
+
+		const ok = await releaseLock({} as any, "b", "p", result, noWait);
+
+		expect(ok).toBe(true);
+		expect(s3State.lock).toBeNull();
+		expect(result.errors).toHaveLength(0);
+		expect(vi.mocked(s3.deleteLock)).toHaveBeenCalledTimes(2);
+	});
+
+	it("surfaces the failure (does not swallow) when every attempt fails", async () => {
+		s3State.lock = { deviceName: "me", timestamp: 1000 };
+		const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
+		const created: string[] = [];
+
+		vi.mocked(s3.deleteLock).mockRejectedValue(new Error("S3 down"));
+
+		const ok = await releaseLock(
+			{} as any,
+			"b",
+			"p",
+			result,
+			noWait,
+			(m) => created.push(m)
+		);
+
+		expect(ok).toBe(false);
+		// The error is recorded on the result, not silently dropped.
+		expect(result.errors.length).toBeGreaterThan(0);
+		expect(result.errors[0]).toMatch(/lock/i);
+		// The lock is still on S3 — the leak is real and must be reported.
+		expect(s3State.lock).not.toBeNull();
+		// The user is notified.
+		expect(created.some((m) => /lock/i.test(m))).toBe(true);
+	});
+});
+
+describe("runSync — a failed final lock release is reported, not swallowed", () => {
+	it("a successful sync whose deleteLock fails still surfaces the leak in result.errors", async () => {
+		const content = "hello";
+		const hash = await hashOf(content);
+
+		// Nothing to pull; one local-only file to push so the sync does real work.
+		s3State.manifest = manifest(1000, "peer", []);
+		const app = makeMockApp([{ path: "note.md", content, mtime: 5000 }]);
+		const cachedManifest = manifest(1000, "me", []);
+
+		// The final lock release fails permanently.
+		vi.mocked(s3.deleteLock).mockRejectedValue(new Error("S3 unreachable"));
+
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+		const result = await runSync(
+			app as any,
+			{} as any,
+			settings(),
+			{ manifest: cachedManifest },
+			async () => {},
+			undefined,
+			undefined,
+			plan.hashCache,
+			plan.remoteManifest
+		);
+
+		void hash;
+		// The sync itself succeeded (file pushed) but the leaked lock is reported.
+		expect(result.errors.some((e) => /lock/i.test(e))).toBe(true);
+	});
+});

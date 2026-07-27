@@ -1,6 +1,7 @@
 import { Notice, Plugin } from "obsidian";
 import { S3SyncSettings, DEFAULT_SETTINGS, S3SyncSettingTab } from "./settings";
-import { createS3Client } from "./s3";
+import { createS3Client, getLock, deleteLock } from "./s3";
+import { isLockStale } from "./manifest";
 import { runSync, SyncResult } from "./sync";
 import { SyncProgressModal } from "./modal";
 import type { S3Client } from "@aws-sdk/client-s3";
@@ -32,6 +33,12 @@ export default class SimpleS3SyncPlugin extends Plugin {
 			id: "sync-now",
 			name: "Sync now",
 			callback: () => this.doSync(),
+		});
+
+		this.addCommand({
+			id: "release-lock",
+			name: "Release sync lock (force)",
+			callback: () => this.doReleaseLock(),
 		});
 
 		this.addSettingTab(new S3SyncSettingTab(this.app, this));
@@ -178,6 +185,39 @@ export default class SimpleS3SyncPlugin extends Plugin {
 		} finally {
 			this.syncing = false;
 			statusBar.remove();
+		}
+	}
+
+	/**
+	 * Force-clear a leaked/stuck advisory lock on S3.
+	 *
+	 * A sync that dies after acquiring the lock but before its finally releases
+	 * it (mobile app suspended, network drop on the final delete) leaves
+	 * `.sync-lock.json` behind, blocking other devices until it goes stale. This
+	 * gives the user an explicit escape hatch instead of waiting out the 5-minute
+	 * stale window. It reports who holds the lock and whether it was already
+	 * stale, so the user knows what they cleared.
+	 */
+	private async doReleaseLock() {
+		if (!this.s3Client) {
+			new Notice("Simple S3 Sync: configure S3 settings first");
+			return;
+		}
+		const { s3Bucket, s3Prefix } = this.settings;
+		try {
+			const lock = await getLock(this.s3Client, s3Bucket, s3Prefix);
+			if (!lock) {
+				new Notice("S3 Sync: no lock is currently held");
+				return;
+			}
+			await deleteLock(this.s3Client, s3Bucket, s3Prefix);
+			const staleNote = isLockStale(lock) ? " (was already stale)" : "";
+			new Notice(
+				`S3 Sync: released lock held by "${lock.deviceName}"${staleNote}`
+			);
+		} catch (e: any) {
+			new Notice(`S3 Sync: failed to release lock — ${e.message}`);
+			console.error("S3 Sync release-lock error:", e);
 		}
 	}
 }

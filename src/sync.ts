@@ -37,6 +37,56 @@ function checkAborted(signal?: AbortSignal) {
 	if (signal?.aborted) throw new SyncCancelledError();
 }
 
+// Extra attempts after the first before giving up on releasing the lock.
+const LOCK_RELEASE_RETRIES = 2;
+// Base backoff between release attempts (multiplied by attempt index).
+const LOCK_RELEASE_BACKOFF_MS = 1000;
+
+const realSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Best-effort release of the advisory lock, with retry and loud failure.
+ *
+ * The final lock delete used to be fire-and-forget (`.catch(() => {})`). A
+ * flaky network on that last call — common on mobile — leaves `.sync-lock.json`
+ * on S3 while the sync itself reports success, blocking every other device for
+ * up to 5 minutes (LOCK_STALE_MS) with no indication why. Here we retry a few
+ * times and, if the lock still can't be dropped, record it on `result.errors`
+ * and notify the user so they can clear it (the "Release sync lock" command).
+ *
+ * Never throws: it runs from `runSync`'s finally block, so throwing would mask
+ * the real sync error. `sleep`/`notify` are injectable for tests.
+ *
+ * @returns true if the lock was released, false if it leaked.
+ */
+export async function releaseLock(
+	client: S3Client,
+	bucket: string,
+	prefix: string,
+	result: SyncResult,
+	sleep: (ms: number) => Promise<void> = realSleep,
+	notify: (message: string) => void = (message) => new Notice(message)
+): Promise<boolean> {
+	let lastErr: unknown = null;
+	for (let attempt = 0; attempt <= LOCK_RELEASE_RETRIES; attempt++) {
+		if (attempt > 0) await sleep(LOCK_RELEASE_BACKOFF_MS * attempt);
+		try {
+			await s3.deleteLock(client, bucket, prefix);
+			return true;
+		} catch (e) {
+			lastErr = e;
+		}
+	}
+	const detail = lastErr instanceof Error ? lastErr.message : String(lastErr);
+	const msg =
+		`S3 Sync: could not release the sync lock (${detail}). ` +
+		`Other devices may be blocked for up to 5 minutes — run ` +
+		`"Release sync lock" from the command palette to clear it now.`;
+	result.errors.push(msg);
+	notify(msg);
+	return false;
+}
+
 // Drop tombstones (deleted entries) older than retentionMs. Returns a fresh
 // manifest with the old entries removed and the count dropped.
 //
@@ -670,7 +720,7 @@ export async function runSync(
 		}
 		await saveCachedData({ manifest: updatedManifest });
 	} finally {
-		await s3.deleteLock(client, bucket, prefix).catch(() => {});
+		await releaseLock(client, bucket, prefix, result);
 	}
 
 	return result;
