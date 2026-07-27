@@ -211,10 +211,18 @@ export default class SimpleS3SyncPlugin extends Plugin {
 				return;
 			}
 			await deleteLock(this.s3Client, s3Bucket, s3Prefix);
-			const staleNote = isLockStale(lock) ? " (was already stale)" : "";
-			new Notice(
-				`S3 Sync: released lock held by "${lock.deviceName}"${staleNote}`
-			);
+			if (isLockStale(lock)) {
+				new Notice(
+					`S3 Sync: released stale lock held by "${lock.deviceName}"`
+				);
+			} else {
+				// A fresh lock may belong to a device syncing right now; forcing
+				// it removes the guard both devices rely on.
+				new Notice(
+					`S3 Sync: released FRESH lock held by "${lock.deviceName}" — ` +
+						`if that device is syncing right now, let its sync finish before you sync.`
+				);
+			}
 		} catch (e: any) {
 			new Notice(`S3 Sync: failed to release lock — ${e.message}`);
 			console.error("S3 Sync release-lock error:", e);
