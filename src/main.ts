@@ -3,6 +3,7 @@ import { S3SyncSettings, DEFAULT_SETTINGS, S3SyncSettingTab } from "./settings";
 import { createS3Client, getLock, deleteLock } from "./s3";
 import { isLockStale } from "./manifest";
 import { runSync, SyncResult } from "./sync";
+import { computeSyncPlan } from "./plan";
 import { SyncProgressModal } from "./modal";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { SyncManifest } from "./manifest";
@@ -145,23 +146,52 @@ export default class SimpleS3SyncPlugin extends Plugin {
 		const statusBar = this.addStatusBarItem();
 		statusBar.setText("S3 Sync: connecting...");
 
-		const updateStatusBar = (step: 3 | 4 | 5 | 6, detail: string, r: SyncResult) => {
+		const updateStatusBar = (_step: 3 | 4 | 5 | 6, detail: string, _r: SyncResult) => {
 			statusBar.setText(`S3 Sync: ${detail}`);
 		};
 
 		try {
 			const fullData = await this.loadFullData();
+			const cachedManifest =
+				fullData.localManifest?.manifest ??
+				createEmptyManifest(this.settings.deviceName);
+
+			// Compute the plan first (mirrors the interactive modal). When there's
+			// nothing to do we return before acquiring the lock — an auto-sync tick
+			// on a quiet vault must not put `.sync-lock.json` on S3, which would
+			// otherwise flash a spurious "Sync locked by <device>" at any peer that
+			// happens to sync inside that window.
+			//
+			// Tradeoff: skipping runSync on empty plans also skips tombstone GC and
+			// empty-folder cleanup on those ticks. That's fine — those run on the
+			// next tick that has real work, matching how the modal behaves on
+			// "Nothing to sync".
+			const plan = await computeSyncPlan(
+				this.app,
+				this.s3Client,
+				this.settings,
+				cachedManifest,
+				(detail) => statusBar.setText(`S3 Sync: ${detail}`)
+			);
+
+			if (plan.entries.length === 0) {
+				new Notice("S3 Sync: up to date");
+				return;
+			}
 
 			const result = await runSync(
 				this.app,
 				this.s3Client,
 				this.settings,
-				fullData.localManifest ?? null,
+				{ manifest: cachedManifest },
 				async (cached) => {
 					fullData.localManifest = cached;
 					await this.saveData(fullData);
 				},
-				updateStatusBar
+				updateStatusBar,
+				undefined,
+				plan.hashCache,
+				plan.remoteManifest
 			);
 
 			const parts: string[] = [];
