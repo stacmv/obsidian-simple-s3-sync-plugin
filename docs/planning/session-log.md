@@ -59,6 +59,12 @@ Lightweight session history tracking. This log captures:
 
 ---
 
+### 2026-07
+
+[Claude Code] 2026-07-27: Filed [20260727-bug-stale-device-silent-overwrite](../issues/open/20260727-bug-stale-device-silent-overwrite/) — a stale device silently overwrites newer content on other devices (real incident: phone `pova3` rolled back `desktop`'s daily-generated `Home.md` + ~22 files, no conflict copy). Root cause: scalar `version` last-writer-wins with no recency tiebreak.
+
+---
+
 ## Statistics
 
 **Total Issues Closed:** X
