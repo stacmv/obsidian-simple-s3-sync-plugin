@@ -418,6 +418,7 @@ export class SyncProgressModal extends Modal {
 		if (r.pulled) parts.push(`${r.pulled} downloaded`);
 		if (r.pushed) parts.push(`${r.pushed} uploaded`);
 		if (r.conflicts) parts.push(`${r.conflicts} conflicts`);
+		if (r.deferredDeletions) parts.push(`${r.deferredDeletions} deletions deferred`);
 		if (r.errors.length) parts.push(`${r.errors.length} errors`);
 		return parts.join(", ");
 	}

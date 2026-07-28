@@ -63,6 +63,8 @@ Lightweight session history tracking. This log captures:
 
 [Claude Code] 2026-07-27: Filed [20260727-bug-stale-device-silent-overwrite](../issues/open/20260727-bug-stale-device-silent-overwrite/) — a stale device silently overwrites newer content on other devices (real incident: phone `pova3` rolled back `desktop`'s daily-generated `Home.md` + ~22 files, no conflict copy). Root cause: scalar `version` last-writer-wins with no recency tiebreak.
 
+[Claude Code] 2026-07-28: Ad-hoc hotfix for phantom deletions by stale devices (real incident: `pova3` tombstoned 9 files it never had — today's photo-job output + meal-plan notes; `desktop` auto-sync then silently trashed them locally mid-diagnosis; recovered via vault git + cache rebuild). Fixes: cached manifest now records only disk-reconciled entries (was: full remote manifest incl. re-check merges, failed downloads, filter-excluded paths); 404 downloads are loud errors; push never tombstones paths absent from the cached manifest; auto-sync runs with `applyDeletions: false` (deferred to manual sync review); new "Reset local sync state" command. Related open issue: 20260727-bug-stale-device-silent-overwrite (causal-guard core fix still pending).
+
 ---
 
 ## Statistics

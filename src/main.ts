@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { App, Modal, Notice, Plugin } from "obsidian";
 import { S3SyncSettings, DEFAULT_SETTINGS, S3SyncSettingTab } from "./settings";
 import { createS3Client, getLock, deleteLock } from "./s3";
 import { isLockStale } from "./manifest";
@@ -40,6 +40,12 @@ export default class SimpleS3SyncPlugin extends Plugin {
 			id: "release-lock",
 			name: "Release sync lock (force)",
 			callback: () => this.doReleaseLock(),
+		});
+
+		this.addCommand({
+			id: "reset-sync-state",
+			name: "Reset local sync state (forget cached manifest)",
+			callback: () => this.doResetSyncState(),
 		});
 
 		this.addSettingTab(new S3SyncSettingTab(this.app, this));
@@ -191,13 +197,20 @@ export default class SimpleS3SyncPlugin extends Plugin {
 				updateStatusBar,
 				undefined,
 				plan.hashCache,
-				plan.remoteManifest
+				plan.remoteManifest,
+				// Auto-sync must never delete anything: deletions are destructive
+				// and only the manual sync modal shows the user what exactly goes.
+				{ applyDeletions: false }
 			);
 
 			const parts: string[] = [];
 			if (result.pulled) parts.push(`${result.pulled} downloaded`);
 			if (result.pushed) parts.push(`${result.pushed} uploaded`);
 			if (result.conflicts) parts.push(`${result.conflicts} conflicts`);
+			if (result.deferredDeletions)
+				parts.push(
+					`${result.deferredDeletions} deletion${result.deferredDeletions === 1 ? "" : "s"} pending — run "Sync now" to review`
+				);
 			if (result.errors.length) parts.push(`${result.errors.length} errors`);
 
 			new Notice(
@@ -216,6 +229,32 @@ export default class SimpleS3SyncPlugin extends Plugin {
 			this.syncing = false;
 			statusBar.remove();
 		}
+	}
+
+	/**
+	 * Forget the locally cached sync manifest after user confirmation.
+	 *
+	 * The cached manifest is this device's memory of what it has synced. When it
+	 * gets out of step with the actual disk state (interrupted syncs, restored
+	 * backups, Android storage cleanups), the next sync misreads missing files
+	 * as local deletions and tombstones them on S3. Resetting the cache makes
+	 * the next sync rebuild its view from S3 + disk: missing files become plain
+	 * downloads, local-only files become uploads — nothing becomes a deletion.
+	 */
+	private doResetSyncState() {
+		new ConfirmResetModal(this.app, async () => {
+			if (this.syncing) {
+				new Notice("S3 Sync: cannot reset while a sync is running");
+				return;
+			}
+			const data = await this.loadFullData();
+			delete data.localManifest;
+			await this.saveData(data);
+			new Notice(
+				"S3 Sync: local sync state cleared. The next sync re-scans every file " +
+					"(slower, one time) and will not delete anything on S3."
+			);
+		}).open();
 	}
 
 	/**
@@ -257,5 +296,45 @@ export default class SimpleS3SyncPlugin extends Plugin {
 			new Notice(`S3 Sync: failed to release lock — ${e.message}`);
 			console.error("S3 Sync release-lock error:", e);
 		}
+	}
+}
+
+class ConfirmResetModal extends Modal {
+	private onConfirm: () => void;
+
+	constructor(app: App, onConfirm: () => void) {
+		super(app);
+		this.onConfirm = onConfirm;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl("h2", { text: "Reset local sync state?" });
+		contentEl.createEl("p", {
+			text:
+				"This makes the device forget which files it has already synced. " +
+				"Use it when sync wrongly offers to delete files you never touched.",
+		});
+		contentEl.createEl("p", {
+			text:
+				"The next sync will re-scan everything: missing files are " +
+				"re-downloaded, local-only files are re-uploaded, nothing is deleted. " +
+				"If you have local edits not yet synced, they may be overwritten by " +
+				"the S3 version — sync them first if possible.",
+		});
+
+		const row = contentEl.createDiv({ cls: "s3-sync-button-row" });
+		const resetBtn = row.createEl("button", { text: "Reset", cls: "mod-warning" });
+		resetBtn.addEventListener("click", () => {
+			this.close();
+			this.onConfirm();
+		});
+		const cancelBtn = row.createEl("button", { text: "Cancel" });
+		cancelBtn.addEventListener("click", () => this.close());
+	}
+
+	onClose() {
+		this.contentEl.empty();
 	}
 }

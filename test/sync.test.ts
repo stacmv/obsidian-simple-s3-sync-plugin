@@ -613,6 +613,325 @@ describe("runSync — partial failures must not poison cached state (regression)
 	});
 });
 
+describe("runSync — cached manifest must only record disk-reconciled entries (phantom-deletion regression)", () => {
+	// Real incident 2026-07-28: pova3's cached manifest accumulated entries for
+	// files that never landed on its disk. The next sync classified them as
+	// "deleted locally" and tombstoned them on S3, destroying peers' fresh files.
+
+	it("entries merged from the finalize re-check are NOT persisted to the local cache", async () => {
+		// We push one file. While we sync, a peer concurrently uploads
+		// peer-new.md — it arrives via the finalize re-check merge. It must go
+		// into the S3 manifest (peer's entry survives) but NOT into our cached
+		// manifest: we never downloaded it, so caching it would flag it as
+		// "deleted locally" on our next sync.
+		const mineHash = await hashOf("mine");
+		const peerHash = await hashOf("peer content");
+
+		const initialRemote = manifest(1000, "peer", []);
+		s3State.manifest = initialRemote;
+
+		const app = makeMockApp([{ path: "mine.md", content: "mine", mtime: 5000 }]);
+		const cachedManifest = manifest(1000, "me", []);
+
+		// Finalize re-check sees the peer's concurrent upload.
+		const recheck = manifest(2000, "peer", [
+			entry({
+				path: "peer-new.md",
+				sha256: peerHash,
+				version: 1,
+				lastSyncedBy: "peer",
+				lastSyncedAt: 2000,
+			}),
+		]);
+
+		let savedCache: { manifest: SyncManifest } | null = null;
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+
+		// The peer's upload lands AFTER our planning phase — only the finalize
+		// re-check (the next getManifest call) sees it.
+		vi.mocked(s3.getManifest).mockImplementation(async () =>
+			JSON.parse(JSON.stringify(recheck))
+		);
+		await runSync(
+			app as any,
+			{} as any,
+			settings(),
+			{ manifest: cachedManifest },
+			async (d) => {
+				savedCache = JSON.parse(JSON.stringify(d));
+			},
+			undefined,
+			undefined,
+			plan.hashCache,
+			plan.remoteManifest
+		);
+
+		// Restore the default getManifest mock for subsequent tests.
+		vi.mocked(s3.getManifest).mockImplementation(async () =>
+			s3State.manifest ? (JSON.parse(JSON.stringify(s3State.manifest)) as SyncManifest) : null
+		);
+
+		// Peer's entry must survive in the S3 manifest (re-check merge intact).
+		expect(s3State.manifest!.files["peer-new.md"]).toBeDefined();
+		expect(s3State.manifest!.files["peer-new.md"].deleted).toBe(false);
+
+		// Our push is recorded in both S3 manifest and cache.
+		expect(s3State.manifest!.files["mine.md"].sha256).toBe(mineHash);
+		expect(savedCache!.manifest.files["mine.md"]?.sha256).toBe(mineHash);
+
+		// THE FIX: peer-new.md was never on our disk — it must NOT be cached.
+		expect(savedCache!.manifest.files["peer-new.md"]).toBeUndefined();
+
+		// And the next plan must want to download it — not delete it.
+		const plan2 = await computeSyncPlan(
+			app as any,
+			{} as any,
+			settings(),
+			savedCache!.manifest
+		);
+		expect(plan2.entries.find((e) => e.path === "peer-new.md")?.action).toBe(
+			"download-new"
+		);
+	});
+
+	it("a download that 404s is reported as an error and NOT persisted to the cache", async () => {
+		const ghostHash = await hashOf("ghost content");
+
+		// Manifest lists ghost.md but the blob is missing on S3 (downloadFile → null).
+		s3State.manifest = manifest(2000, "peer", [
+			entry({ path: "ghost.md", sha256: ghostHash, version: 1 }),
+		]);
+		// s3State.files deliberately does NOT contain ghost.md.
+
+		const app = makeMockApp([]);
+		const cachedManifest = manifest(1000, "me", []);
+
+		let savedCache: { manifest: SyncManifest } | null = null;
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+		expect(plan.entries.find((e) => e.path === "ghost.md")?.action).toBe("download-new");
+
+		const result = await runSync(
+			app as any,
+			{} as any,
+			settings(),
+			{ manifest: cachedManifest },
+			async (d) => {
+				savedCache = JSON.parse(JSON.stringify(d));
+			},
+			undefined,
+			undefined,
+			plan.hashCache,
+			plan.remoteManifest
+		);
+
+		// The failed download is loud, not silent.
+		expect(result.errors.some((e) => e.includes("ghost.md"))).toBe(true);
+
+		// The entry must not be cached — nothing landed on disk.
+		expect(savedCache!.manifest.files["ghost.md"]).toBeUndefined();
+
+		// Next sync still wants to download it — NOT delete it from S3.
+		const plan2 = await computeSyncPlan(
+			app as any,
+			{} as any,
+			settings(),
+			savedCache!.manifest
+		);
+		expect(plan2.entries.find((e) => e.path === "ghost.md")?.action).toBe(
+			"download-new"
+		);
+	});
+
+	it("remote entries excluded by local filters are NOT persisted to the cache", async () => {
+		// Per-device selective sync: the phone excludes Archive/**. Those remote
+		// entries must never enter its cache — otherwise re-enabling the filter
+		// (or any cache/desync) marks them "deleted locally".
+		const rootHash = await hashOf("root");
+		const archHash = await hashOf("archived");
+
+		s3State.files.set("root.md", new TextEncoder().encode("root"));
+		s3State.files.set("Archive/a.md", new TextEncoder().encode("archived"));
+		s3State.manifest = manifest(2000, "peer", [
+			entry({ path: "root.md", sha256: rootHash, version: 1 }),
+			entry({ path: "Archive/a.md", sha256: archHash, version: 1 }),
+		]);
+
+		const s = settings();
+		s.excludePatterns = ["Archive/**"];
+
+		const app = makeMockApp([]);
+		const cachedManifest = manifest(1000, "me", []);
+
+		let savedCache: { manifest: SyncManifest } | null = null;
+		const plan = await computeSyncPlan(app as any, {} as any, s, cachedManifest);
+		await runSync(
+			app as any,
+			{} as any,
+			s,
+			{ manifest: cachedManifest },
+			async (d) => {
+				savedCache = JSON.parse(JSON.stringify(d));
+			},
+			undefined,
+			undefined,
+			plan.hashCache,
+			plan.remoteManifest
+		);
+
+		// root.md downloaded and cached; Archive/a.md neither downloaded nor cached.
+		expect(app.vault.getAbstractFileByPath("root.md")).not.toBeNull();
+		expect(savedCache!.manifest.files["root.md"]).toBeDefined();
+		expect(app.vault.getAbstractFileByPath("Archive/a.md")).toBeNull();
+		expect(savedCache!.manifest.files["Archive/a.md"]).toBeUndefined();
+
+		// S3 manifest still carries the excluded entry for other devices.
+		expect(s3State.manifest!.files["Archive/a.md"]).toBeDefined();
+	});
+});
+
+describe("runSync — auto-sync must never apply deletions (applyDeletions: false)", () => {
+	it("defers a remote tombstone instead of trashing the local file", async () => {
+		const hash = await hashOf("content");
+
+		// Peer deleted gone.md; we still have it and cached knows it alive.
+		// deletedAt is recent so tombstone GC doesn't interfere with the test.
+		const deletedAt = Date.now() - 1000;
+		s3State.manifest = manifest(2000, "peer", [
+			entry({
+				path: "gone.md",
+				sha256: hash,
+				version: 2,
+				deleted: true,
+				deletedBy: "peer",
+				deletedAt,
+				lastSyncedAt: 2000,
+			}),
+		]);
+		const app = makeMockApp([{ path: "gone.md", content: "content", mtime: 1000 }]);
+		const cachedManifest = manifest(1000, "me", [
+			entry({ path: "gone.md", sha256: hash, version: 1, mtimeMs: 1000 }),
+		]);
+
+		let savedCache: { manifest: SyncManifest } | null = null;
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+		expect(plan.entries.find((e) => e.path === "gone.md")?.action).toBe("delete-local");
+
+		const result = await runSync(
+			app as any,
+			{} as any,
+			settings(),
+			{ manifest: cachedManifest },
+			async (d) => {
+				savedCache = JSON.parse(JSON.stringify(d));
+			},
+			undefined,
+			undefined,
+			plan.hashCache,
+			plan.remoteManifest,
+			{ applyDeletions: false }
+		);
+
+		// Local file is untouched.
+		expect(app.vault.getAbstractFileByPath("gone.md")).not.toBeNull();
+		// The deferral is visible in the result.
+		expect(result.deferredDeletions).toBe(1);
+		// Cache still shows the file alive so a manual sync re-plans the deletion.
+		expect(savedCache!.manifest.files["gone.md"].deleted).toBe(false);
+
+		const plan2 = await computeSyncPlan(
+			app as any,
+			{} as any,
+			settings(),
+			savedCache!.manifest
+		);
+		expect(plan2.entries.find((e) => e.path === "gone.md")?.action).toBe("delete-local");
+	});
+
+	it("defers a local deletion instead of tombstoning the file on S3", async () => {
+		const hash = await hashOf("content");
+
+		// File exists on S3 and in cache, but is gone from local disk.
+		s3State.files.set("mine-gone.md", new TextEncoder().encode("content"));
+		s3State.manifest = manifest(2000, "me", [
+			entry({ path: "mine-gone.md", sha256: hash, version: 1, mtimeMs: 1000 }),
+		]);
+		const app = makeMockApp([]);
+		const cachedManifest = manifest(2000, "me", [
+			entry({ path: "mine-gone.md", sha256: hash, version: 1, mtimeMs: 1000 }),
+		]);
+
+		let savedCache: { manifest: SyncManifest } | null = null;
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+		expect(plan.entries.find((e) => e.path === "mine-gone.md")?.action).toBe(
+			"delete-remote"
+		);
+
+		const result = await runSync(
+			app as any,
+			{} as any,
+			settings(),
+			{ manifest: cachedManifest },
+			async (d) => {
+				savedCache = JSON.parse(JSON.stringify(d));
+			},
+			undefined,
+			undefined,
+			plan.hashCache,
+			plan.remoteManifest,
+			{ applyDeletions: false }
+		);
+
+		// S3 blob and live manifest entry are untouched.
+		expect(s3State.files.has("mine-gone.md")).toBe(true);
+		expect(s3State.manifest!.files["mine-gone.md"].deleted).toBe(false);
+		expect(result.deferredDeletions).toBe(1);
+		// Cache keeps the alive entry so a manual sync re-plans the deletion.
+		expect(savedCache!.manifest.files["mine-gone.md"].deleted).toBe(false);
+	});
+
+	it("manual mode (default) still applies both deletion directions", async () => {
+		const hash = await hashOf("content");
+
+		const deletedAt = Date.now() - 1000;
+		s3State.manifest = manifest(2000, "peer", [
+			entry({
+				path: "gone.md",
+				sha256: hash,
+				version: 2,
+				deleted: true,
+				deletedBy: "peer",
+				deletedAt,
+				lastSyncedAt: 2000,
+			}),
+		]);
+		const app = makeMockApp([{ path: "gone.md", content: "content", mtime: 1000 }]);
+		const cachedManifest = manifest(1000, "me", [
+			entry({ path: "gone.md", sha256: hash, version: 1, mtimeMs: 1000 }),
+		]);
+
+		let savedCache: { manifest: SyncManifest } | null = null;
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+		const result = await runSync(
+			app as any,
+			{} as any,
+			settings(),
+			{ manifest: cachedManifest },
+			async (d) => {
+				savedCache = JSON.parse(JSON.stringify(d));
+			},
+			undefined,
+			undefined,
+			plan.hashCache,
+			plan.remoteManifest
+		);
+
+		// Deletion applied: file trashed, tombstone acknowledged in cache.
+		expect(app.vault.getAbstractFileByPath("gone.md")).toBeNull();
+		expect(result.deferredDeletions).toBe(0);
+		expect(savedCache!.manifest.files["gone.md"].deleted).toBe(true);
+	});
+});
+
 import { gcOldTombstones } from "../src/sync";
 
 describe("gcOldTombstones — unit", () => {
@@ -921,7 +1240,7 @@ describe("releaseLock — a leaked lock must never be swallowed", () => {
 
 	it("returns true and clears the lock on success", async () => {
 		s3State.lock = { deviceName: "me", timestamp: 1000 };
-		const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
+		const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, deferredDeletions: 0, errors: [] };
 
 		const ok = await releaseLock({} as any, "b", "p", result, noWait);
 
@@ -932,7 +1251,7 @@ describe("releaseLock — a leaked lock must never be swallowed", () => {
 
 	it("retries a transient failure and succeeds", async () => {
 		s3State.lock = { deviceName: "me", timestamp: 1000 };
-		const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
+		const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, deferredDeletions: 0, errors: [] };
 
 		// Call history accumulates across the file (no clearMocks); reset it so
 		// the count assertion below only measures this test's attempts.
@@ -953,7 +1272,7 @@ describe("releaseLock — a leaked lock must never be swallowed", () => {
 
 	it("surfaces the failure (does not swallow) when every attempt fails", async () => {
 		s3State.lock = { deviceName: "me", timestamp: 1000 };
-		const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
+		const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, deferredDeletions: 0, errors: [] };
 		const created: string[] = [];
 
 		vi.mocked(s3.deleteLock).mockRejectedValue(new Error("S3 down"));

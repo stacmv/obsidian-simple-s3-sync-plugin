@@ -13,7 +13,19 @@ export interface SyncResult {
 	pulled: number;
 	pushed: number;
 	conflicts: number;
+	// Deletions detected but not applied because the sync ran with
+	// applyDeletions: false (auto-sync). Reviewed and applied in manual sync.
+	deferredDeletions: number;
 	errors: string[];
+}
+
+export interface SyncOptions {
+	// When false, neither direction of deletion is executed: remote tombstones
+	// are not applied to local files, and locally-missing files are not
+	// tombstoned on S3. Deletions are only counted in result.deferredDeletions.
+	// Auto-sync runs with false — destructive actions require the manual
+	// confirmation modal where the user sees exactly what will be deleted.
+	applyDeletions?: boolean;
 }
 
 interface LocalCachedManifest {
@@ -305,15 +317,29 @@ export async function runSync(
 	onProgress?: SyncProgressCallback,
 	signal?: AbortSignal,
 	hashCache?: HashCache,
-	cachedRemoteManifest?: SyncManifest
+	cachedRemoteManifest?: SyncManifest,
+	options?: SyncOptions
 ): Promise<SyncResult> {
-	const result: SyncResult = { pulled: 0, pushed: 0, conflicts: 0, errors: [] };
+	const applyDeletions = options?.applyDeletions ?? true;
+	const result: SyncResult = {
+		pulled: 0,
+		pushed: 0,
+		conflicts: 0,
+		deferredDeletions: 0,
+		errors: [],
+	};
 	const { s3Bucket: bucket, s3Prefix: prefix, deviceName } = settings;
 
 	// Paths whose local file was overwritten with remote content in step 4
 	// (clean pulls and conflict keep-both losers). Step 5 uses this to refresh
 	// their cached mtime without re-uploading.
 	const pulledPaths = new Set<string>();
+
+	// Remote tombstones NOT applied because applyDeletions is false. The push
+	// phase must leave these alone entirely: uploading the still-present local
+	// file would silently resurrect it, overriding the peer's deletion without
+	// the user ever seeing it. The manual sync decides.
+	const deferredDeletionPaths = new Set<string>();
 
 	// --- Step 3: Acquire lock ---
 	onProgress?.(3, "Checking lock...", result);
@@ -400,6 +426,12 @@ export async function runSync(
 							// of the path at all (cached missing). In both cases the
 							// local file is a fresh creation here — leave it alone
 							// and let the push phase resurrect it on S3.
+						} else if (!applyDeletions) {
+							// Auto-sync: never delete. Leave the file and its cached
+							// entry untouched so a manual sync re-plans the deletion
+							// for explicit user review.
+							result.deferredDeletions++;
+							deferredDeletionPaths.add(path);
 						} else {
 							try {
 								await app.vault.trash(localFile, true);
@@ -429,7 +461,15 @@ export async function runSync(
 					}
 					// New file from remote (or a superseded-tombstone resurrection): download it
 					const data = await s3.downloadFile(client, bucket, prefix, path);
-					if (data) {
+					if (!data) {
+						// Manifest lists the file but the blob is gone (404). Stay
+						// loud and do NOT reconcile: silently skipping used to
+						// leave a cached entry with no file on disk, which the next
+						// sync misread as a local deletion and tombstoned on S3.
+						result.errors.push(`Download ${path}: object missing on S3`);
+						continue;
+					}
+					{
 						const dir = path.contains("/")
 							? path.substring(0, path.lastIndexOf("/"))
 							: "";
@@ -484,7 +524,10 @@ export async function runSync(
 				if (localChanged && remoteChanged) {
 					// TRUE CONFLICT
 					const remoteData = await s3.downloadFile(client, bucket, prefix, path);
-					if (!remoteData) continue;
+					if (!remoteData) {
+						result.errors.push(`Download ${path}: object missing on S3`);
+						continue;
+					}
 
 					const resolved = await resolveConflict(
 						app,
@@ -516,7 +559,9 @@ export async function runSync(
 				} else if (remoteChanged && !localChanged) {
 					// Remote is newer, no local changes: just pull
 					const remoteData = await s3.downloadFile(client, bucket, prefix, path);
-					if (remoteData) {
+					if (!remoteData) {
+						result.errors.push(`Download ${path}: object missing on S3`);
+					} else {
 						await app.vault.modifyBinary(localFile, remoteData.buffer as ArrayBuffer);
 						// Local file is now the remote content; keep hashCache aligned so
 						// the push phase doesn't treat its own write as a local change
@@ -563,6 +608,9 @@ export async function runSync(
 			onProgress?.(5, `Checking local ${pushIndex} / ${pushTotal}`, result);
 
 			const path = file.path;
+			// A deferred remote deletion: don't push (that would resurrect the
+			// file and silently override the peer's deletion). Manual sync decides.
+			if (deferredDeletionPaths.has(path)) continue;
 			const existing = updatedManifest.files[path];
 
 			if (!existing || existing.deleted) {
@@ -586,6 +634,7 @@ export async function runSync(
 					version: (existing?.version ?? 0) + 1,
 					deleted: false,
 				};
+				reconciledPaths.add(path);
 				result.pushed++;
 			} else {
 				// Existing non-deleted entry: hash-only check first (cache hit = zero disk I/O for unchanged files)
@@ -601,19 +650,24 @@ export async function runSync(
 						mtimeMs: file.stat.mtime,
 						sizeBytes: file.stat.size,
 						lastSyncedBy: deviceName,
-						lastSyncedAt: Date.now(),
+					lastSyncedAt: Date.now(),
 						version: existing.version + 1,
 					};
+					reconciledPaths.add(path);
 					result.pushed++;
-				} else if (pulledPaths.has(path)) {
-					// We just wrote remote content here; bump cached mtimeMs to the
-					// post-write local mtime so the next sync's mtime pre-filter
-					// recognizes the file as unchanged without re-reading it.
-					updatedManifest.files[path] = {
-						...existing,
-						mtimeMs: file.stat.mtime,
-						sizeBytes: file.stat.size,
-					};
+				} else {
+					if (pulledPaths.has(path)) {
+						// We just wrote remote content here; bump cached mtimeMs to the
+						// post-write local mtime so the next sync's mtime pre-filter
+						// recognizes the file as unchanged without re-reading it.
+						updatedManifest.files[path] = {
+							...existing,
+							mtimeMs: file.stat.mtime,
+							sizeBytes: file.stat.size,
+						};
+					}
+					// Disk content verified equal to the manifest entry — safe to cache.
+					reconciledPaths.add(path);
 				}
 			}
 		}
@@ -627,12 +681,25 @@ export async function runSync(
 
 			const localFile = app.vault.getAbstractFileByPath(normalizePath(path));
 			if (!localFile) {
+				// Only a file this device previously reconciled (present in the
+				// cached manifest) can be interpreted as "deleted locally". A live
+				// manifest entry with no cached record means the file never landed
+				// on this disk — e.g. its download failed above, or the entry came
+				// from another device mid-sync. Tombstoning it would destroy the
+				// peer's content (incident 2026-07-28).
+				const cachedEntry = cachedManifest.files[path];
+				if (!cachedEntry) continue;
 				// Defensive: if this live entry is NEWER than our cached tombstone, a
 				// peer resurrected it after our deletion. The pull phase should have
 				// downloaded it; if it somehow didn't (e.g. failed download), never
 				// re-tombstone it — that would destroy the peer's content.
-				const cachedTomb = cachedManifest.files[path];
-				if (cachedTomb?.deleted && entry.version > cachedTomb.version) {
+				if (cachedEntry.deleted && entry.version > cachedEntry.version) {
+					continue;
+				}
+				if (!applyDeletions) {
+					// Auto-sync: never tombstone on S3. Keep the cached entry alive
+					// so a manual sync re-plans the deletion for user review.
+					result.deferredDeletions++;
 					continue;
 				}
 				const now = Date.now();
@@ -654,6 +721,7 @@ export async function runSync(
 					lastSyncedBy: deviceName,
 					lastSyncedAt: now,
 				};
+				reconciledPaths.add(path);
 				result.pushed++;
 			}
 		}
@@ -718,7 +786,17 @@ export async function runSync(
 			onProgress?.(6, "Writing manifest...", result);
 			await s3.putManifest(client, bucket, prefix, updatedManifest);
 		}
-		await saveCachedData({ manifest: updatedManifest });
+
+		// Persist only entries reconciled against this device's disk — NOT the
+		// full updatedManifest. The full manifest contains entries this device
+		// never downloaded (skipped/failed pulls, finalize re-check merges from
+		// concurrent peers, filter-excluded paths); caching those poisons the
+		// next plan into reading "in cache but not on disk" as a local deletion
+		// and tombstoning files the user never touched (incident 2026-07-28).
+		const finalSnapshot = buildCheckpointSnapshot();
+		finalSnapshot.lastUpdated = updatedManifest.lastUpdated;
+		finalSnapshot.lastUpdatedBy = updatedManifest.lastUpdatedBy;
+		await saveCachedData({ manifest: finalSnapshot });
 	} finally {
 		await releaseLock(client, bucket, prefix, result);
 	}
