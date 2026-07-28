@@ -2,7 +2,7 @@ import { App, TFile, normalizePath } from "obsidian";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { S3SyncSettings } from "./settings";
 import type { SyncManifest } from "./manifest";
-import { createEmptyManifest } from "./manifest";
+import { assertManifestNotStale, createEmptyManifest } from "./manifest";
 import { shouldSyncFile } from "./filter";
 import { sha256 } from "./hash";
 import * as s3 from "./s3";
@@ -48,6 +48,10 @@ export async function computeSyncPlan(
 	const remoteManifest =
 		(await s3.getManifest(client, bucket, prefix)) ??
 		createEmptyManifest(settings.deviceName);
+
+	// A manifest older than what we already incorporated is a stale read
+	// (HTTP cache / S3 lag) — planning against it produces phantom deletions.
+	assertManifestNotStale(remoteManifest, cachedManifest);
 
 	// Pre-count files to compare for progress reporting
 	const remoteEntries = Object.entries(remoteManifest.files).filter(

@@ -932,6 +932,126 @@ describe("runSync — auto-sync must never apply deletions (applyDeletions: fals
 	});
 });
 
+describe("stale manifest read protection (regression 2026-07-28, second incident)", () => {
+	// Real incident: right after a sync pushed resurrections (manifest T2), the
+	// next plan was built from a STALE manifest (T1, served by an HTTP cache)
+	// still carrying tombstones — and proposed re-deleting the fresh files.
+	// A fetched manifest older than what this device has already incorporated
+	// must abort the sync, never produce a destructive plan.
+
+	it("computeSyncPlan throws when the fetched manifest is older than local state", async () => {
+		const hash = await hashOf("content");
+
+		// Local cache reflects manifest state T=5000; the "fetched" one is T=1000
+		// and still shows a tombstone for a file we know is alive.
+		s3State.manifest = manifest(1000, "peer", [
+			entry({
+				path: "file.md",
+				sha256: hash,
+				version: 2,
+				deleted: true,
+				deletedBy: "peer",
+				deletedAt: 900,
+				lastSyncedAt: 900,
+			}),
+		]);
+		const app = makeMockApp([{ path: "file.md", content: "content", mtime: 1000 }]);
+		const cachedManifest = manifest(5000, "me", [
+			entry({ path: "file.md", sha256: hash, version: 3, mtimeMs: 1000 }),
+		]);
+
+		await expect(
+			computeSyncPlan(app as any, {} as any, settings(), cachedManifest)
+		).rejects.toThrow(/stale/i);
+	});
+
+	it("an empty local cache (fresh device or after reset) never triggers the guard", async () => {
+		const hash = await hashOf("content");
+		// Empty cache stamps lastUpdated with the current time — newer than any
+		// remote. That must not be read as "remote is stale".
+		s3State.manifest = manifest(1000, "peer", [
+			entry({ path: "file.md", sha256: hash, version: 1 }),
+		]);
+		s3State.files.set("file.md", new TextEncoder().encode("content"));
+		const app = makeMockApp([]);
+		const cachedManifest = manifest(Date.now(), "me", []);
+
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+		expect(plan.entries.find((e) => e.path === "file.md")?.action).toBe("download-new");
+	});
+
+	it("runSync refuses to run against a stale manifest", async () => {
+		const hash = await hashOf("content");
+		const staleRemote = manifest(1000, "peer", [
+			entry({ path: "file.md", sha256: hash, version: 2, deleted: true, deletedAt: 900 }),
+		]);
+		const app = makeMockApp([{ path: "file.md", content: "content", mtime: 1000 }]);
+		const cachedManifest = manifest(5000, "me", [
+			entry({ path: "file.md", sha256: hash, version: 3, mtimeMs: 1000 }),
+		]);
+
+		await expect(
+			runSync(
+				app as any,
+				{} as any,
+				settings(),
+				{ manifest: cachedManifest },
+				async () => {},
+				undefined,
+				undefined,
+				new Map(),
+				staleRemote
+			)
+		).rejects.toThrow(/stale/i);
+
+		// Nothing was touched.
+		expect(app.vault.getAbstractFileByPath("file.md")).not.toBeNull();
+	});
+
+	it("a stale finalize re-check is ignored instead of merged", async () => {
+		// The re-check merge must only accept manifests NEWER than the one the
+		// sync started from — an older body (cache flashback) could reintroduce
+		// entries that were since removed.
+		const mineHash = await hashOf("mine");
+		const ghostHash = await hashOf("ghost");
+
+		const current = manifest(5000, "peer", []);
+		s3State.manifest = current;
+		const app = makeMockApp([{ path: "mine.md", content: "mine", mtime: 6000 }]);
+		const cachedManifest = manifest(5000, "me", []);
+
+		const plan = await computeSyncPlan(app as any, {} as any, settings(), cachedManifest);
+
+		// Re-check returns an OLDER manifest carrying a long-gone entry.
+		const staleRecheck = manifest(1000, "old", [
+			entry({ path: "ghost.md", sha256: ghostHash, version: 9, lastSyncedAt: 1000 }),
+		]);
+		vi.mocked(s3.getManifest).mockImplementation(async () =>
+			JSON.parse(JSON.stringify(staleRecheck))
+		);
+
+		await runSync(
+			app as any,
+			{} as any,
+			settings(),
+			{ manifest: cachedManifest },
+			async () => {},
+			undefined,
+			undefined,
+			plan.hashCache,
+			plan.remoteManifest
+		);
+
+		vi.mocked(s3.getManifest).mockImplementation(async () =>
+			s3State.manifest ? (JSON.parse(JSON.stringify(s3State.manifest)) as SyncManifest) : null
+		);
+
+		// Our push landed; the stale ghost entry did NOT come back.
+		expect(s3State.manifest!.files["mine.md"]?.sha256).toBe(mineHash);
+		expect(s3State.manifest!.files["ghost.md"]).toBeUndefined();
+	});
+});
+
 import { gcOldTombstones } from "../src/sync";
 
 describe("gcOldTombstones — unit", () => {

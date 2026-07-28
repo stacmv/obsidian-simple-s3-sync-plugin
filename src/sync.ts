@@ -2,7 +2,7 @@ import { App, Notice, TFile, normalizePath } from "obsidian";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { S3SyncSettings } from "./settings";
 import type { SyncManifest } from "./manifest";
-import { createEmptyManifest, isLockStale } from "./manifest";
+import { assertManifestNotStale, createEmptyManifest, isLockStale } from "./manifest";
 import type { HashCache } from "./plan";
 import { shouldSyncFile } from "./filter";
 import { sha256 } from "./hash";
@@ -373,6 +373,9 @@ export async function runSync(
 
 		const cachedManifest = cachedData?.manifest ?? createEmptyManifest(deviceName);
 
+		// Same guard as planning: never execute against a time-reversed manifest.
+		assertManifestNotStale(remoteManifest, cachedManifest);
+
 		// Accumulates the new S3 state across steps 4/5. Initialized from remoteManifest
 		// so files we don't touch round-trip cleanly through step 6's putManifest.
 		const updatedManifest: SyncManifest = {
@@ -730,11 +733,13 @@ export async function runSync(
 		onProgress?.(6, "Writing manifest...", result);
 		checkAborted(signal);
 
-		// Re-check for concurrent changes
+		// Re-check for concurrent changes. Only a manifest NEWER than the one this
+		// sync started from is merged — an older body is a stale cache flashback
+		// and could reintroduce entries that were since removed.
 		const recheckManifest = await s3.getManifest(client, bucket, prefix);
 		if (
 			recheckManifest &&
-			recheckManifest.lastUpdated !== remoteManifest.lastUpdated
+			recheckManifest.lastUpdated > remoteManifest.lastUpdated
 		) {
 			// Another device synced concurrently: merge manifests
 			for (const [path, entry] of Object.entries(recheckManifest.files)) {

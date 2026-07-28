@@ -41,7 +41,7 @@ function buildUrl(request: any): string {
 	return url;
 }
 
-function obsidianRequestHandler() {
+export function obsidianRequestHandler() {
 	return {
 		handle: async (request: any) => {
 			const url = buildUrl(request);
@@ -58,6 +58,13 @@ function obsidianRequestHandler() {
 			// host header is set automatically
 			delete headers["host"];
 			delete headers["Host"];
+			// Opt out of HTTP caching. S3 responses carry no Cache-Control, so
+			// Electron applies heuristic caching and can serve a stale
+			// .sync-manifest.json — a time-reversed manifest resurrects old
+			// tombstones and plans phantom deletions (incident 2026-07-28).
+			// These headers are not SigV4-signed, so the signature stays valid.
+			headers["cache-control"] = "no-cache";
+			headers["pragma"] = "no-cache";
 
 			let body: ArrayBuffer | undefined;
 			if (request.body) {
