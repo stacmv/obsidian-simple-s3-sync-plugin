@@ -311,3 +311,103 @@ describe("computeSyncPlan — empty cached manifest (cache wipe)", () => {
 		expect(entry!.action).toBe("conflict");
 	});
 });
+
+describe("computeSyncPlan — an unmodified copy of a deleted file must not resurrect it", () => {
+	// Incident 2026-09-08: closing a week renames "36.md" -> "36 (60 из 90 = 67%).md",
+	// i.e. one create + one delete. A device that still held the untouched "36.md"
+	// planned it as `upload-new` — resurrecting the peer's deletion — because the
+	// only question asked was "does cached still know this file alive?". The file
+	// content was never compared with the tombstone it was answering.
+	//
+	// Rule: if the local bytes are EXACTLY the deleted version (sha256 matches the
+	// tombstone), this is not a fresh local creation — it is the very copy the peer
+	// deleted, and the deletion stands. Different bytes are still a real local
+	// creation and are still resurrected (tests above).
+
+	it("plans delete-local when cached also shows deleted but local content matches the tombstone", async () => {
+		const content = "# Неделя 36\n\n### Work\n- [x] done\n";
+		const tombstoneHash = await hashOf(content);
+
+		mockedGetManifest.mockResolvedValue({
+			schemaVersion: 1,
+			lastUpdated: 3000,
+			lastUpdatedBy: "desktop",
+			files: {
+				"@Weekly/36.md": makeEntry({
+					path: "@Weekly/36.md",
+					sha256: tombstoneHash,
+					version: 2,
+					deleted: true,
+					deletedBy: "desktop",
+					deletedAt: 2500,
+				}),
+			},
+		});
+
+		const cachedManifest: SyncManifest = {
+			schemaVersion: 1,
+			lastUpdated: 3000,
+			lastUpdatedBy: "phone",
+			files: {
+				"@Weekly/36.md": makeEntry({
+					path: "@Weekly/36.md",
+					sha256: tombstoneHash,
+					version: 2,
+					deleted: true,
+					deletedBy: "desktop",
+					deletedAt: 2500,
+				}),
+			},
+		};
+
+		const plan = await computeSyncPlan(
+			makeMockApp([{ path: "@Weekly/36.md", mtime: 5000, content }]),
+			{} as any,
+			makeSettings(),
+			cachedManifest,
+		);
+
+		const entry = plan.entries.find((e) => e.path === "@Weekly/36.md");
+		expect(entry).toBeDefined();
+		expect(entry!.action).toBe("delete-local");
+	});
+
+	it("plans delete-local when cached has no entry but local content matches the tombstone", async () => {
+		const content = "same bytes as the deleted file";
+		const tombstoneHash = await hashOf(content);
+
+		mockedGetManifest.mockResolvedValue({
+			schemaVersion: 1,
+			lastUpdated: 3000,
+			lastUpdatedBy: "desktop",
+			files: {
+				"@Weekly/36.md": makeEntry({
+					path: "@Weekly/36.md",
+					sha256: tombstoneHash,
+					version: 2,
+					deleted: true,
+					deletedBy: "desktop",
+					deletedAt: 2500,
+				}),
+			},
+		});
+
+		const cachedManifest: SyncManifest = {
+			schemaVersion: 1,
+			lastUpdated: 1000,
+			lastUpdatedBy: "phone",
+			files: {},
+		};
+
+		const plan = await computeSyncPlan(
+			makeMockApp([{ path: "@Weekly/36.md", mtime: 5000, content }]),
+			{} as any,
+			makeSettings(),
+			cachedManifest,
+		);
+
+		const entry = plan.entries.find((e) => e.path === "@Weekly/36.md");
+		expect(entry).toBeDefined();
+		expect(entry!.action).toBe("delete-local");
+	});
+});

@@ -423,12 +423,29 @@ export async function runSync(
 				if (remote.deleted) {
 					// Remote deleted: trash local copy if it exists
 					if (localFile instanceof TFile) {
-						if (!cached || cached.deleted) {
-							// Either we already acknowledged this deletion in a prior
-							// sync (cached.deleted), or this device never had a record
-							// of the path at all (cached missing). In both cases the
-							// local file is a fresh creation here — leave it alone
-							// and let the push phase resurrect it on S3.
+						// Either we already acknowledged this deletion in a prior
+						// sync (cached.deleted), or this device never had a record of
+						// the path at all (cached missing). Both look like a fresh
+						// creation here — but that is a statement about this device's
+						// bookkeeping, not about the file. Compare the bytes against the
+						// version the tombstone records first: identical content is not a
+						// re-creation, it is the very copy the peer deleted, and letting
+						// the push phase resurrect it silently undoes their deletion.
+						// That is how the deletion got lost on 2026-09-08 — a stale
+						// "@Weekly/36.md" left over from a week rename was pushed back
+						// live, so no later sync (manual ones included) had a deletion
+						// left to apply, and the duplicate survived until the week
+						// planner re-closed the week over it.
+						let looksFreshlyCreated = !cached || cached.deleted;
+						if (looksFreshlyCreated) {
+							const localHash = await getHashOnly(app, localFile, hashCache);
+							if (localHash === remote.sha256) looksFreshlyCreated = false;
+						}
+
+						if (looksFreshlyCreated) {
+							// Genuinely different content: a real local file, which still
+							// outranks the peer's deletion. Leave it alone and let the
+							// push phase resurrect it on S3.
 						} else if (!applyDeletions) {
 							// Auto-sync: never delete. Leave the file and its cached
 							// entry untouched so a manual sync re-plans the deletion

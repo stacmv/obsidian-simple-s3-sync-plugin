@@ -1448,3 +1448,140 @@ describe("runSync — a failed final lock release is reported, not swallowed", (
 		expect(result.errors.some((e) => /lock/i.test(e))).toBe(true);
 	});
 });
+
+describe("runSync — an unmodified copy of a deleted file must not be re-uploaded", () => {
+	// Incident 2026-09-08 (@Weekly/36.md): the device still holding the untouched
+	// file treated it as a fresh local creation and pushed it back to S3, undoing
+	// the peer's deletion. The manifest entry went live again, so every later sync
+	// — manual ones included — had no deletion left to apply, and the duplicate
+	// survived for a day until the week planner re-closed the week over it.
+	//
+	// The upload side is what loses the deletion, so that is what changes here.
+	// Auto-sync still deletes nothing locally: it defers, exactly as before.
+
+	// Earlier describes in this file replace the s3.getManifest mock with
+	// mockImplementation() and never restore it, so a later describe would read
+	// THEIR manifests instead of s3State. Restore the shared default here.
+	beforeEach(() => {
+		vi.mocked(s3.getManifest).mockImplementation(async () =>
+			s3State.manifest
+				? (JSON.parse(JSON.stringify(s3State.manifest)) as SyncManifest)
+				: null
+		);
+		vi.mocked(s3.deleteLock).mockImplementation(async () => {
+			s3State.lock = null;
+		});
+		vi.mocked(s3.uploadFile).mockClear();
+	});
+
+	const CONTENT = "# Неделя 36\n\n### Work\n- [x] done\n";
+
+	function tombstoneManifest(hash: string): SyncManifest {
+		return manifest(2000, "desktop", [
+			entry({
+				path: "@Weekly/36.md",
+				sha256: hash,
+				version: 2,
+				deleted: true,
+				deletedBy: "desktop",
+				deletedAt: Date.now() - 1000,
+				lastSyncedAt: 2000,
+			}),
+		]);
+	}
+
+	// Cached entry already carries the tombstone: this device acknowledged the
+	// deletion at some point, yet the file is still on disk.
+	function cachedWithTombstone(hash: string): SyncManifest {
+		return manifest(2000, "phone", [
+			entry({
+				path: "@Weekly/36.md",
+				sha256: hash,
+				version: 2,
+				deleted: true,
+				deletedBy: "desktop",
+				deletedAt: Date.now() - 1000,
+				lastSyncedAt: 2000,
+			}),
+		]);
+	}
+
+	async function run(
+		app: any,
+		cachedManifest: SyncManifest,
+		options?: { applyDeletions?: boolean }
+	) {
+		let savedCache: { manifest: SyncManifest } | null = null;
+		const plan = await computeSyncPlan(app, {} as any, settings("phone"), cachedManifest);
+		const result = await runSync(
+			app,
+			{} as any,
+			settings("phone"),
+			{ manifest: cachedManifest },
+			async (d) => {
+				savedCache = JSON.parse(JSON.stringify(d));
+			},
+			undefined,
+			undefined,
+			plan.hashCache,
+			plan.remoteManifest,
+			options
+		);
+		return { result, savedCache: savedCache as unknown as { manifest: SyncManifest } };
+	}
+
+	it("auto-sync keeps the file on disk but never pushes it back to S3", async () => {
+		const hash = await hashOf(CONTENT);
+		s3State.manifest = tombstoneManifest(hash);
+		const app = makeMockApp([{ path: "@Weekly/36.md", content: CONTENT, mtime: 1000 }]);
+
+		const { result } = await run(app, cachedWithTombstone(hash), { applyDeletions: false });
+
+		// The tombstone survives — nothing resurrected it.
+		expect(s3State.manifest!.files["@Weekly/36.md"].deleted).toBe(true);
+		expect(vi.mocked(s3.uploadFile).mock.calls.some((c) => c[3] === "@Weekly/36.md")).toBe(false);
+		// Auto-sync deletes nothing locally; the deletion is merely pending.
+		expect(app.vault.getAbstractFileByPath("@Weekly/36.md")).not.toBeNull();
+		expect(result.deferredDeletions).toBe(1);
+	});
+
+	it("manual sync applies the pending deletion instead of resurrecting the file", async () => {
+		const hash = await hashOf(CONTENT);
+		s3State.manifest = tombstoneManifest(hash);
+		const app = makeMockApp([{ path: "@Weekly/36.md", content: CONTENT, mtime: 1000 }]);
+
+		const { result, savedCache } = await run(app, cachedWithTombstone(hash));
+
+		expect(app.vault.getAbstractFileByPath("@Weekly/36.md")).toBeNull();
+		expect(s3State.manifest!.files["@Weekly/36.md"].deleted).toBe(true);
+		expect(savedCache.manifest["files"]["@Weekly/36.md"].deleted).toBe(true);
+		expect(result.errors).toEqual([]);
+	});
+
+	it("applies the deletion even when this device has no cached record of the file", async () => {
+		const hash = await hashOf(CONTENT);
+		s3State.manifest = tombstoneManifest(hash);
+		const app = makeMockApp([{ path: "@Weekly/36.md", content: CONTENT, mtime: 1000 }]);
+
+		const { result } = await run(app, manifest(1000, "phone", []));
+
+		expect(app.vault.getAbstractFileByPath("@Weekly/36.md")).toBeNull();
+		expect(s3State.manifest!.files["@Weekly/36.md"].deleted).toBe(true);
+		expect(result.errors).toEqual([]);
+	});
+
+	it("still resurrects a file whose local content differs from the tombstone", async () => {
+		const tombstoneHash = await hashOf(CONTENT);
+		s3State.manifest = tombstoneManifest(tombstoneHash);
+		const app = makeMockApp([
+			{ path: "@Weekly/36.md", content: "написано заново, руками", mtime: 5000 },
+		]);
+
+		const { result } = await run(app, cachedWithTombstone(tombstoneHash));
+
+		// Real local content beats a peer's deletion, exactly as before.
+		expect(app.vault.getAbstractFileByPath("@Weekly/36.md")).not.toBeNull();
+		expect(s3State.manifest!.files["@Weekly/36.md"].deleted).toBe(false);
+		expect(result.pushed).toBeGreaterThan(0);
+	});
+});

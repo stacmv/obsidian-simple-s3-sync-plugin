@@ -80,7 +80,22 @@ export async function computeSyncPlan(
 				// having ever seen the file alive). Only fall through to
 				// delete-local when cached previously had it alive — that means
 				// the tombstone is a peer's deletion of a file we know we shared.
-				const action = !cached || cached.deleted ? "upload-new" : "delete-local";
+				//
+				// …but "looks like a fresh creation" is a statement about this
+				// device's bookkeeping, not about the file. Compare the bytes with
+				// the version the tombstone records: identical content is not a
+				// re-creation, it is the very copy the peer deleted, and uploading
+				// it silently undoes their deletion (incident 2026-09-08 — a stale
+				// "@Weekly/36.md" left over from a week rename kept coming back, so
+				// no later sync had a deletion left to apply). Different bytes are a
+				// genuine local file and still win over the tombstone.
+				let action: SyncAction = "delete-local";
+				if (!cached || cached.deleted) {
+					const localData = new Uint8Array(await app.vault.readBinary(localFile));
+					const localHash = await sha256(localData.buffer as ArrayBuffer);
+					hashCache.set(path, localHash);
+					if (localHash !== remote.sha256) action = "upload-new";
+				}
 				entries.push({ path, action });
 				planned.add(path);
 			}
