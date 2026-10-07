@@ -45,7 +45,7 @@ export class SyncCancelledError extends Error {
 	}
 }
 
-function checkAborted(signal?: AbortSignal) {
+export function checkAborted(signal?: AbortSignal) {
 	if (signal?.aborted) throw new SyncCancelledError();
 }
 

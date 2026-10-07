@@ -26,6 +26,7 @@ Obsidian plugin that syncs vault files to S3. Six core modules:
 
 - **`plan.ts`** — Compares local vault vs remote manifest vs cached manifest. Uses mtime pre-filter to skip disk reads for unchanged files. Produces a list of actions: download-new/update, upload-new/update, delete-local/remote, conflict.
 - **`sync.ts`** — Executes the plan in 6 steps: plan → confirm → lock → pull → push → finalize. Handles conflict resolution, manifest re-check for concurrent devices, advisory locking (5-min stale timeout).
+- **`background.ts`** — `BackgroundSync`: one auto-sync run (interval tick, deletions deferred) with an observable snapshot and abort. "Sync now" during a run attaches the progress modal to it (Hide / Cancel) instead of starting a second sync.
 - **`s3.ts`** — All S3 operations. Uses Obsidian's `requestUrl` (bypasses CORS) with AWS SDK v3 signature. Soft-deletes to `_trash/` prefix.
 - **`merge.ts`** — 3-way merge via `node-diff3` for markdown; binary files always use keep-both strategy.
 - **`filter.ts`** — Glob-based include/exclude via `picomatch`. Hardcoded exclusions: `.sync-manifest.json`, `.sync-lock.json`, `.sync-ancestors/**`, `.obsidian/plugins/*/data.json`.

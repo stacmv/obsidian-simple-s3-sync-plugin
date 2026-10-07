@@ -2,9 +2,8 @@ import { App, Modal, Notice, Plugin } from "obsidian";
 import { S3SyncSettings, DEFAULT_SETTINGS, S3SyncSettingTab } from "./settings";
 import { createS3Client, getLock, deleteLock } from "./s3";
 import { isLockStale } from "./manifest";
-import { runSync, SyncResult } from "./sync";
-import { computeSyncPlan } from "./plan";
 import { SyncProgressModal } from "./modal";
+import { BackgroundSync, BackgroundSnapshot } from "./background";
 import type { S3Client } from "@aws-sdk/client-s3";
 import type { SyncManifest } from "./manifest";
 import { createEmptyManifest } from "./manifest";
@@ -20,6 +19,7 @@ export default class SimpleS3SyncPlugin extends Plugin {
 	private intervalId: number | null = null;
 	private syncing = false;
 	private activeModal: SyncProgressModal | null = null;
+	private background: BackgroundSync | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -109,9 +109,12 @@ export default class SimpleS3SyncPlugin extends Plugin {
 			return;
 		}
 		if (this.syncing) {
-			// Sync already running — bring existing modal to front if available
+			// Sync already running — bring existing modal to front, or bring the
+			// auto-sync to the foreground so it can be watched and cancelled
 			if (this.activeModal) {
 				this.activeModal.bringToFront();
+			} else if (this.background && !this.background.finished) {
+				this.attachToBackground(this.background);
 			} else {
 				new Notice("Sync already in progress");
 			}
@@ -144,91 +147,76 @@ export default class SimpleS3SyncPlugin extends Plugin {
 		this.activeModal.open();
 	}
 
+	/** Opens the progress modal on top of an auto-sync already in flight. */
+	private attachToBackground(background: BackgroundSync) {
+		const modal = new SyncProgressModal(
+			this.app,
+			this.s3Client!,
+			this.settings,
+			createEmptyManifest(this.settings.deviceName), // unused when attached
+			async () => {},
+			() => {
+				// Only stop tracking the modal: the background run owns `syncing`
+				if (this.activeModal === modal) this.activeModal = null;
+			},
+			background
+		);
+		this.activeModal = modal;
+		modal.open();
+	}
+
 	/** Silent sync for auto-interval (no modal, status bar only). */
 	async doSyncSilent() {
 		if (!this.s3Client) return;
 		if (this.syncing) return;
 		this.syncing = true;
-		const statusBar = this.addStatusBarItem();
-		statusBar.setText("S3 Sync: connecting...");
 
-		const updateStatusBar = (_step: 3 | 4 | 5 | 6, detail: string, _r: SyncResult) => {
-			statusBar.setText(`S3 Sync: ${detail}`);
-		};
+		let fullData: CachedData | null = null;
+		const background = new BackgroundSync(this.app, this.s3Client, this.settings, {
+			loadCachedManifest: async () => {
+				fullData = await this.loadFullData();
+				return fullData.localManifest?.manifest ?? createEmptyManifest(this.settings.deviceName);
+			},
+			saveCachedData: async (cached) => {
+				fullData!.localManifest = cached;
+				await this.saveData(fullData);
+			},
+		});
+		this.background = background;
+
+		const statusBar = this.addStatusBarItem();
+		const unsubscribe = background.subscribe((s) => {
+			if (s.detail) statusBar.setText(`S3 Sync: ${s.detail}`);
+		});
 
 		try {
-			const fullData = await this.loadFullData();
-			const cachedManifest =
-				fullData.localManifest?.manifest ??
-				createEmptyManifest(this.settings.deviceName);
-
-			// Compute the plan first (mirrors the interactive modal). When there's
-			// nothing to do we return before acquiring the lock — an auto-sync tick
-			// on a quiet vault must not put `.sync-lock.json` on S3, which would
-			// otherwise flash a spurious "Sync locked by <device>" at any peer that
-			// happens to sync inside that window.
-			//
-			// Tradeoff: skipping runSync on empty plans also skips tombstone GC and
-			// empty-folder cleanup on those ticks. That's fine — those run on the
-			// next tick that has real work, matching how the modal behaves on
-			// "Nothing to sync".
-			const plan = await computeSyncPlan(
-				this.app,
-				this.s3Client,
-				this.settings,
-				cachedManifest,
-				(detail) => statusBar.setText(`S3 Sync: ${detail}`)
-			);
-
-			if (plan.entries.length === 0) {
-				new Notice("S3 Sync: up to date");
-				return;
-			}
-
-			const result = await runSync(
-				this.app,
-				this.s3Client,
-				this.settings,
-				{ manifest: cachedManifest },
-				async (cached) => {
-					fullData.localManifest = cached;
-					await this.saveData(fullData);
-				},
-				updateStatusBar,
-				undefined,
-				plan.hashCache,
-				plan.remoteManifest,
-				// Auto-sync must never delete anything: deletions are destructive
-				// and only the manual sync modal shows the user what exactly goes.
-				{ applyDeletions: false }
-			);
-
-			const parts: string[] = [];
-			if (result.pulled) parts.push(`${result.pulled} downloaded`);
-			if (result.pushed) parts.push(`${result.pushed} uploaded`);
-			if (result.conflicts) parts.push(`${result.conflicts} conflicts`);
-			if (result.deferredDeletions)
-				parts.push(
-					`${result.deferredDeletions} deletion${result.deferredDeletions === 1 ? "" : "s"} pending — run "Sync now" to review`
-				);
-			if (result.errors.length) parts.push(`${result.errors.length} errors`);
-
-			new Notice(
-				parts.length > 0
-					? `S3 Sync: ${parts.join(", ")}`
-					: "S3 Sync: up to date"
-			);
-
-			if (result.errors.length) {
-				console.error("S3 Sync errors:", result.errors);
-			}
-		} catch (e: any) {
-			new Notice(`S3 Sync failed: ${e.message}`);
-			console.error("S3 Sync error:", e);
+			const final = await background.run();
+			// An attached modal already shows the outcome; notify only otherwise
+			if (this.activeModal?.watching !== background) new Notice(this.describeBackgroundOutcome(final));
+			if (final.phase === "error") console.error("S3 Sync error:", final.errorMessage);
+			if (final.result?.errors.length) console.error("S3 Sync errors:", final.result.errors);
 		} finally {
-			this.syncing = false;
+			unsubscribe();
 			statusBar.remove();
+			this.background = null;
+			this.syncing = false;
 		}
+	}
+
+	private describeBackgroundOutcome(s: BackgroundSnapshot): string {
+		if (s.phase === "cancelled") return "S3 Sync: cancelled";
+		if (s.phase === "error") return `S3 Sync failed: ${s.errorMessage}`;
+		const r = s.result;
+		const parts: string[] = [];
+		if (r?.pulled) parts.push(`${r.pulled} downloaded`);
+		if (r?.pushed) parts.push(`${r.pushed} uploaded`);
+		if (r?.conflicts) parts.push(`${r.conflicts} conflicts`);
+		if (r?.deferredDeletions)
+			parts.push(
+				`${r.deferredDeletions} deletion${r.deferredDeletions === 1 ? "" : "s"} pending — run "Sync now" to review`
+			);
+		if (r?.errors.length) parts.push(`${r.errors.length} errors`);
+		return parts.length > 0 ? `S3 Sync: ${parts.join(", ")}` : "S3 Sync: up to date";
 	}
 
 	/**

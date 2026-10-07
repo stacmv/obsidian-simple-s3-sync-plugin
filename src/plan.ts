@@ -6,6 +6,7 @@ import { assertManifestNotStale, createEmptyManifest } from "./manifest";
 import { shouldSyncFile } from "./filter";
 import { sha256 } from "./hash";
 import * as s3 from "./s3";
+import { checkAborted } from "./sync";
 
 export type SyncAction =
 	| "download-new"
@@ -36,13 +37,16 @@ export async function computeSyncPlan(
 	client: S3Client,
 	settings: S3SyncSettings,
 	cachedManifest: SyncManifest,
-	onProgress?: PlanProgressCallback
+	onProgress?: PlanProgressCallback,
+	// Planning holds no lock and writes nothing, so aborting it is always safe.
+	signal?: AbortSignal
 ): Promise<SyncPlan> {
 	const { s3Bucket: bucket, s3Prefix: prefix } = settings;
 	const entries: SyncPlanEntry[] = [];
 	const hashCache: HashCache = new Map();
 	const planned = new Set<string>();
 
+	checkAborted(signal);
 	onProgress?.("Fetching remote state...");
 
 	const remoteManifest =
@@ -65,6 +69,7 @@ export async function computeSyncPlan(
 
 	// Check every file known to remote
 	for (const [path, remote] of remoteEntries) {
+		checkAborted(signal);
 		compared++;
 		onProgress?.(`Comparing files ${compared} / ${totalFiles}`);
 
@@ -181,6 +186,7 @@ export async function computeSyncPlan(
 
 	// Check local files not yet covered
 	for (const file of localFiles) {
+		checkAborted(signal);
 		compared++;
 		onProgress?.(`Comparing files ${compared} / ${totalFiles}`);
 

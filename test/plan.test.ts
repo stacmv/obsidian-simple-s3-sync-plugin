@@ -11,6 +11,7 @@ vi.mock("../src/s3", () => ({
 }));
 
 import { computeSyncPlan } from "../src/plan";
+import { SyncCancelledError } from "../src/sync";
 import { getManifest } from "../src/s3";
 
 const mockedGetManifest = vi.mocked(getManifest);
@@ -409,5 +410,33 @@ describe("computeSyncPlan — an unmodified copy of a deleted file must not resu
 		const entry = plan.entries.find((e) => e.path === "@Weekly/36.md");
 		expect(entry).toBeDefined();
 		expect(entry!.action).toBe("delete-local");
+	});
+});
+
+describe("computeSyncPlan — cancellation", () => {
+	it("throws SyncCancelledError when the signal is already aborted", async () => {
+		mockedGetManifest.mockResolvedValue(null);
+		const app = makeMockApp([{ path: "a.md", mtime: 1, content: "a" }]);
+		const ctrl = new AbortController();
+		ctrl.abort();
+
+		await expect(
+			computeSyncPlan(app, {} as any, makeSettings(), createEmptyManifest("phone"), undefined, ctrl.signal)
+		).rejects.toBeInstanceOf(SyncCancelledError);
+	});
+
+	it("stops comparing files once the signal is aborted mid-scan", async () => {
+		mockedGetManifest.mockResolvedValue(null);
+		const files = [1, 2, 3, 4, 5].map((i) => ({ path: `n${i}.md`, mtime: i, content: `c${i}` }));
+		const app = makeMockApp(files);
+		const read = vi.spyOn(app.vault, "readBinary");
+		const ctrl = new AbortController();
+
+		await expect(
+			computeSyncPlan(app, {} as any, makeSettings(), createEmptyManifest("phone"), (detail) => {
+				if (detail === "Comparing files 2 / 5") ctrl.abort();
+			}, ctrl.signal)
+		).rejects.toBeInstanceOf(SyncCancelledError);
+		expect(read.mock.calls.length).toBeLessThan(5);
 	});
 });

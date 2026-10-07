@@ -6,6 +6,7 @@ import type { SyncAction, SyncPlan, SyncPlanEntry, HashCache } from "./plan";
 import type { SyncResult } from "./sync";
 import { computeSyncPlan } from "./plan";
 import { runSync, SyncCancelledError } from "./sync";
+import type { BackgroundSync, BackgroundSnapshot } from "./background";
 
 // ---------------------------------------------------------------------------
 // Shared constants
@@ -96,6 +97,11 @@ export class SyncProgressModal extends Modal {
 
 	private abortController: AbortController | null = null;
 
+	// Set when the modal watches an auto-sync already in flight instead of
+	// running its own plan → confirm → sync cycle.
+	private background: BackgroundSync | null;
+	private unsubscribe: (() => void) | null = null;
+
 	// DOM references for efficient updates
 	private stepEls: HTMLElement[] = [];
 	private detailEl: HTMLElement | null = null;
@@ -108,14 +114,21 @@ export class SyncProgressModal extends Modal {
 		settings: S3SyncSettings,
 		cachedManifest: SyncManifest,
 		saveCachedData: (data: { manifest: SyncManifest }) => Promise<void>,
-		onComplete: (result: SyncResult | null) => void
+		onComplete: (result: SyncResult | null) => void,
+		background?: BackgroundSync
 	) {
 		super(app);
+		this.background = background ?? null;
 		this.client = client;
 		this.settings = settings;
 		this.cachedManifest = cachedManifest;
 		this.saveCachedData = saveCachedData;
 		this.onComplete = onComplete;
+	}
+
+	/** The auto-sync this modal is watching, if any. */
+	get watching(): BackgroundSync | null {
+		return this.background;
 	}
 
 	// Called by plugin when user re-triggers sync while this modal is active.
@@ -136,6 +149,10 @@ export class SyncProgressModal extends Modal {
 	}
 
 	onClose() {
+		// Closing an attached modal only stops watching; the auto-sync goes on
+		// unless the user pressed Cancel.
+		this.unsubscribe?.();
+		this.unsubscribe = null;
 		this.abortController?.abort();
 		this.contentEl.empty();
 	}
@@ -176,8 +193,31 @@ export class SyncProgressModal extends Modal {
 		// Button row
 		this.buttonRow = contentEl.createDiv({ cls: "s3-sync-button-row" });
 
+		if (this.background) {
+			const preview = this.stepEls[1]?.querySelector(".s3-step-label");
+			preview?.setText(`${STEPS[1].label} (skipped: auto-sync)`);
+			this.unsubscribe = this.background.subscribe((s) => this.applySnapshot(s));
+			return;
+		}
+
 		this.render();
 		await this.startPlanning();
+	}
+
+	private applySnapshot(s: BackgroundSnapshot) {
+		this.state = s.phase;
+		this.currentStep = s.stepIndex;
+		this.stepDetail = s.detail;
+		this.result = s.result;
+		this.errorMessage = s.errorMessage;
+		this.render();
+	}
+
+	// Hide: stop watching, let the auto-sync finish on its own (it reports
+	// via a notice once nobody is watching).
+	private detach() {
+		this.finish();
+		super.close();
 	}
 
 	// -----------------------------------------------------------------------
@@ -188,6 +228,7 @@ export class SyncProgressModal extends Modal {
 		this.state = "planning";
 		this.currentStep = 0;
 		this.render();
+		this.abortController = new AbortController();
 
 		try {
 			this.plan = await computeSyncPlan(
@@ -198,7 +239,8 @@ export class SyncProgressModal extends Modal {
 				(detail) => {
 					this.stepDetail = detail;
 					this.renderDetail();
-				}
+				},
+				this.abortController.signal
 			);
 			this.hashCache = this.plan.hashCache;
 			this.stepDetail = "";
@@ -206,7 +248,7 @@ export class SyncProgressModal extends Modal {
 			this.currentStep = 1;
 			this.render();
 		} catch (e: any) {
-			this.state = "error";
+			this.state = e instanceof SyncCancelledError ? "cancelled" : "error";
 			this.errorMessage = e.message;
 			this.render();
 		}
@@ -272,7 +314,10 @@ export class SyncProgressModal extends Modal {
 
 			el.removeClass("s3-step-done", "s3-step-active", "s3-step-pending");
 
-			if (i < this.currentStep) {
+			if (this.background && i === 1) {
+				el.addClass("s3-step-pending");
+				icon.setText("–");
+			} else if (i < this.currentStep) {
 				el.addClass("s3-step-done");
 				icon.setText("✓");
 			} else if (i === this.currentStep && this.state !== "done") {
@@ -373,7 +418,14 @@ export class SyncProgressModal extends Modal {
 		if (!this.buttonRow) return;
 		this.buttonRow.empty();
 
-		if (this.state === "confirming" && this.plan) {
+		if (this.background && (this.state === "planning" || this.state === "syncing")) {
+			const hideBtn = this.buttonRow.createEl("button", { text: "Hide" });
+			hideBtn.addEventListener("click", () => this.detach());
+			const cancelBtn = this.buttonRow.createEl("button", { text: "Cancel" });
+			// The background run's terminal snapshot moves the modal to "cancelled"
+			cancelBtn.addEventListener("click", () => this.background?.abort());
+
+		} else if (this.state === "confirming" && this.plan) {
 			const hasChanges = this.plan.entries.length > 0;
 
 			if (hasChanges) {
@@ -392,8 +444,9 @@ export class SyncProgressModal extends Modal {
 
 		} else if (this.state === "planning") {
 			const cancelBtn = this.buttonRow.createEl("button", { text: "Cancel" });
-			// Planning can't be aborted; override the block just for this explicit cancel
+			// Stop planning and close right away; close() itself is blocked while planning
 			cancelBtn.addEventListener("click", () => {
+				this.abortController?.abort();
 				this.finish();
 				super.close();
 			});
@@ -418,7 +471,11 @@ export class SyncProgressModal extends Modal {
 		if (r.pulled) parts.push(`${r.pulled} downloaded`);
 		if (r.pushed) parts.push(`${r.pushed} uploaded`);
 		if (r.conflicts) parts.push(`${r.conflicts} conflicts`);
-		if (r.deferredDeletions) parts.push(`${r.deferredDeletions} deletions deferred`);
+		if (r.deferredDeletions)
+			parts.push(
+				`${r.deferredDeletions} deletions deferred` +
+					(this.background ? " (run Sync now to review)" : "")
+			);
 		if (r.errors.length) parts.push(`${r.errors.length} errors`);
 		return parts.join(", ");
 	}
